@@ -5,10 +5,12 @@
 # DeepSpeed Team
 import argparse
 import math
+import time
 import os
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
+from transformers.trainer_utils import seed_worker
 
 from transformers import (
     AutoModelForCausalLM,
@@ -21,7 +23,7 @@ from transformers import (
 
 import deepspeed
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
-from deepspeed import get_accelerator
+from deepspeed import get_accelerator, PipelineModule
 
 from dschat.utils.data.data_utils import create_prompt_dataset, create_prompt_dataset_2
 from dschat.utils.utils import print_rank_0, to_device, save_hf_format, set_random_seed, get_all_reduce_mean, get_optimizer_grouped_parameters, save_zero_three_model, load_hf_tokenizer
@@ -29,7 +31,8 @@ from dschat.utils.ds_utils import get_train_ds_config
 from dschat.utils.module.lora import convert_linear_layer_to_lora, convert_lora_to_linear_layer, only_optimize_lora_parameters, make_model_gradient_checkpointing_compatible
 from dschat.utils.model.model_utils import create_hf_model, causal_lm_model_to_fp32_loss
 from dschat.utils.perf import print_throughput
-
+from pipelayers import PreEmbeddingPipeLayer, DecoderPipeLayer, NormPipeLayer, LMHeadPipeLayer, LossPipeLayer
+from pipelayers import get_model, DataCollatorForPromptDataset
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -65,12 +68,12 @@ def parse_args():
     # arg1.1
     parser.add_argument('--is_eval',
                         type=bool,
-                        default=True,
+                        default=False,
                         help='whether need to do evaluation')
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=1,
+        default=0,
         help="DataLoader process numer, for both train and eval",
     )
     parser.add_argument(
@@ -84,13 +87,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=6,
+        default=3,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=6,
+        default=3,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -103,7 +106,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-4,
+        default=1e-5,
         help=
         "Initial learning rate (after the potential warmup period) to use.",
     )
@@ -164,7 +167,7 @@ def parse_args():
                         help='Enable ZeRO Offload techniques.')
     parser.add_argument('--dtype',
                         type=str,
-                        default='fp16',
+                        default='bf16',
                         choices=['fp16', 'bf16'],
                         help='Training data type')
     parser.add_argument(
@@ -175,7 +178,8 @@ def parse_args():
     ## LoRA for efficient training setting
     parser.add_argument("--lora_dim",
                         type=int,
-                        default=16,
+                        # default=16,
+                        default = 0,
                         help="If > 0, use LoRA for efficient training.")
     parser.add_argument("--lora_dropout",
                         type=float,
@@ -203,7 +207,7 @@ def parse_args():
     parser.add_argument(
         "--lora_learning_rate",
         type=float,
-        default=1e-4,
+        default=1e-5,
         help=
         "Initial LoRA learning rate (after the potential warmup period) to use."
     )
@@ -230,11 +234,32 @@ def parse_args():
                         action='store_true',
                         default=True,
                         help='Prints loss at each step.')
+
+    parser.add_argument('--num_stages',
+                        default=1,
+                        help='pipeline stages.')
+    parser.add_argument('--save_model_step',
+                        default=2000,
+                        help='steps to save model checkpoint.')
+    parser.add_argument('--flash_attention',
+                        default=False,
+                        help='whether using flash attention.')
+
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
 
     return args
 
+
+
+# def get_model(model):
+#     layers = [TiedLayerSpec("word_embeddings", EmbeddingPipeLayer, model=model),
+#               *[LayerSpec(GLMBlockPipeLayer, model=model, layer_idx=idx) for idx in
+#                 range(model.config.num_layers)],
+#               LayerSpec(FLNPipeLayer, model=model),
+#               TiedLayerSpec("word_embeddings", LMPipeLayer, model=model),
+#               LayerSpec(LossPipeLayer, model=model)]
+#     return layers
 
 def main():
 
@@ -251,35 +276,65 @@ def main():
 
     args.global_rank = torch.distributed.get_rank()
 
-    ds_config = get_train_ds_config(offload=args.offload,
-                                    dtype=args.dtype,
-                                    stage=args.zero_stage,
-                                    enable_tensorboard=args.enable_tensorboard,
-                                    tb_path=args.tensorboard_path,
-                                    tb_name="step1_model")
-    ds_config[
-        'train_micro_batch_size_per_gpu'] = args.per_device_train_batch_size
-    ds_config[
-        'train_batch_size'] = args.per_device_train_batch_size * torch.distributed.get_world_size(
-        ) * args.gradient_accumulation_steps
-
+    #pipeline ds_config  copy from pipeline chatglm
+    ds_config = {"train_micro_batch_size_per_gpu": args.per_device_train_batch_size,
+                 "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                 "optimizer": {
+                     "type": "Adam",
+                     "params": {
+                         "lr": 2e-5,
+                         "betas": [
+                             0.9,
+                             0.95
+                         ],
+                         "eps": 1e-8,
+                         "weight_decay": 5e-4
+                     }
+                 },
+                 # "bfloat16": {
+                 #     "enabled": True
+                 # },
+                 "fp16": {
+                     "enabled": True,
+                     "loss_scale_window": 100},
+                 "zero_optimization": {
+                     "stage": 1,
+                     "offload_optimizer": {
+                         "device": "cpu",
+                         "pin_memory": True
+                     },
+                     "allgather_partitions": True,
+                     "allgather_bucket_size": 2e8,
+                     "overlap_comm": True,
+                     "reduce_scatter": True,
+                     "reduce_bucket_size": 2e8,
+                     "contiguous_gradients": True
+                 },
+                 "steps_per_print": 5,
+                 "tensorboard": {
+                     "enabled": args.enable_tensorboard,
+                     "output_path": f"{args.tensorboard_path}/ds_tensorboard_logs/",
+                     "job_name": f"step1_model_tensorboard"
+                 }
+                 }
     # If passed along, set the training seed now.
     set_random_seed(args.seed)
-
-    torch.distributed.barrier()
-
+    torch.distributed.barrier(device_ids=[args.global_rank])
+    # torch.distributed.barrier()
     # load_hf_tokenizer will get the correct tokenizer and set padding tokens based on the model family
     args.end_of_conversation_token = "<|endoftext|>"
     additional_special_tokens = args.end_of_conversation_token if args.add_eot_token else None
     tokenizer = load_hf_tokenizer(args.model_name_or_path,
                                   fast_tokenizer=True,
                                   add_special_tokens=additional_special_tokens)
-
     model = create_hf_model(AutoModelForCausalLM,
                             args.model_name_or_path,
                             tokenizer,
                             ds_config,
-                            dropout=args.dropout)
+                            dropout=args.dropout,
+                            resize_embedding=False,
+                            flash_attn = args.flash_attention,
+                            dtype=args.dtype)
 
     if args.compute_fp32_loss:
         print_rank_0(
@@ -320,140 +375,118 @@ def main():
             args.max_seq_len,
             end_of_conversation_token=tokenizer.eos_token,
             sft_only_data_path=args.sft_only_data_path)
-    # DataLoaders creation:
-    if args.local_rank == -1:
-        train_sampler = RandomSampler(train_dataset)
-        if args.is_eval:
-            eval_sampler = SequentialSampler(eval_dataset)
-    else:
-        train_sampler = DistributedSampler(train_dataset)
-        if args.is_eval:
-            eval_sampler = DistributedSampler(eval_dataset)
 
-    data_collator = DataCollatorWithPadding(tokenizer)
+    torch.distributed.barrier(device_ids=[args.global_rank])
+
+    # # DataLoaders creation:
+    # if args.local_rank == -1:
+    #     train_sampler = RandomSampler(train_dataset)
+    #     if args.is_eval:
+    #         eval_sampler = SequentialSampler(eval_dataset)
+    # else:
+    #     train_sampler = DistributedSampler(train_dataset)
+    #     if args.is_eval:
+    #         eval_sampler = DistributedSampler(eval_dataset)
+
+    #data sampler
+    train_sampler = RandomSampler(train_dataset)
+    # train_sampler = DistributedSampler(train_dataset)
+    #here if using randomsampler, no data division applied, do not know how openr1 do
+
+    #data collator
+    # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    # data_collator = DataCollatorWithPadding(tokenizer)
+    data_collator = DataCollatorForPromptDataset(tokenizer, args.max_seq_len)
+
     #data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, truncation=True)
-    train_dataloader = DataLoader(train_dataset,
-                                  collate_fn=data_collator,
-                                  sampler=train_sampler,
-                                  num_workers=args.num_workers,
-                                  batch_size=args.per_device_train_batch_size)
-    if args.is_eval:
-        eval_dataloader = DataLoader(eval_dataset,
-                                     collate_fn=data_collator,
-                                     sampler=eval_sampler,
-                                     num_workers=args.num_workers,
-                                     batch_size=args.per_device_eval_batch_size)
 
-    def evaluation(model, eval_dataloader):
-        model.eval()
-        losses = 0
-        for step, batch in enumerate(eval_dataloader):
-            batch['labels'] = batch['input_ids']
-            batch = to_device(batch, device)
-            with torch.no_grad():
-                outputs = model(**batch)
+    dataloader_params = {
+        "batch_size": args.per_device_train_batch_size,
+        "collate_fn": data_collator,
+        "num_workers": args.num_workers,
+        "pin_memory": True,
+        "persistent_workers": False,
+        "sampler": train_sampler,
+        "drop_last": False,
+        "worker_init_fn": seed_worker,
+        "prefetch_factor": None
+    }
+    train_dataloader = DataLoader(train_dataset, **dataloader_params)
 
-            loss = outputs.loss
-            losses += loss.float()
-        losses = losses / (step + 1)
-        try:
-            losses = get_all_reduce_mean(losses)
-        except:
-            pass
-        try:
-            perplexity = torch.exp(losses).item()
-        except OverflowError:
-            perplexity = float("inf")
-        return perplexity, losses.item()
+    # train_dataloader = DataLoader(train_dataset,
+    #                               collate_fn=data_collator,
+    #                               sampler=train_sampler,
+    #                               num_workers=args.num_workers,
+    #                               batch_size=args.per_device_train_batch_size)
 
-    # Split weights in two groups, one with weight decay and the other not.
-    optimizer_grouped_parameters = get_optimizer_grouped_parameters(
-        model, args.weight_decay, args.lora_learning_rate)
-
-    AdamOptimizer = DeepSpeedCPUAdam if args.offload else FusedAdam
-    optimizer = AdamOptimizer(optimizer_grouped_parameters,
-                              lr=args.learning_rate,
-                              betas=(0.9, 0.95))
-
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps)
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=args.num_train_epochs * num_update_steps_per_epoch,
-    )
-
-    model, optimizer, _, lr_scheduler = deepspeed.initialize(
-        model=model,
-        optimizer=optimizer,
-        args=args,
-        config=ds_config,
-        lr_scheduler=lr_scheduler,
-        dist_init_required=True)
-
+    # pipeline wrap  model
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
+    model_pipe = PipelineModule(layers=get_model(model), num_stages=args.num_stages)
+    model_pipe.to(device).half()
+
+    # AdamOptimizer = DeepSpeedCPUAdam if args.offload else FusedAdam
+    # optimizer = AdamOptimizer(optimizer_grouped_parameters,
+    #                           lr=args.learning_rate,
+    #                           betas=(0.9, 0.95))
+
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps)
+
+    # lr_scheduler = get_scheduler(
+    #     name=args.lr_scheduler_type,
+    #     optimizer=optimizer,
+    #     num_warmup_steps=args.num_warmup_steps,
+    #     num_training_steps=args.num_train_epochs * num_update_steps_per_epoch,
+    # )
+
+
+    #pipeline
+    engine, _, _, _ = deepspeed.initialize(model=model_pipe, config=ds_config, model_parameters=model_pipe.parameters())
+
+    train_dataloader = iter(deepspeed.utils.RepeatingLoader(train_dataloader))
+    # train_dataloader = iter(train_dataloader)
     # Train!
-    print_rank_0("***** Running training *****", args.global_rank)
-    print_rank_0(
-        f"***** Evaluating perplexity, Epoch {0}/{args.num_train_epochs} *****",
-        args.global_rank)
-    # perplexity, eval_loss = evaluation(model, eval_dataloader)
-    # print_rank_0(f"ppl: {perplexity}, loss: {eval_loss}", args.global_rank)
-
-    for epoch in range(args.num_train_epochs):
+    start = time.time()
+    all_loss = 0.0
+    for step in range(args.num_train_epochs * num_update_steps_per_epoch-1):  #-1 is importtant , abandon last residual to avoid error
+        start1 = time.time()
         print_rank_0(
-            f"Beginning of Epoch {epoch+1}/{args.num_train_epochs}, Total Micro Batches {len(train_dataloader)}",
-            args.global_rank)
-        model.train()
-        import time
-        for step, batch in enumerate(train_dataloader):
-            start = time.time()
-            batch['labels'] = batch['input_ids']
-            # batch['labels'] = torch.where(batch["attention_mask"].bool(),
-            #                         batch["input_ids"], tokenizer.pad_token_id)
-            #
-            batch = to_device(batch, device)
-            # if step==15:
-            #     luke = 1
-            outputs = model(**batch, use_cache=False)
-            loss = outputs.loss
-            if args.print_loss:
-                print(
-                    f"Epoch: {epoch}, Step: {step}, Rank: {torch.distributed.get_rank()}, loss = {loss}"
-                )
-            model.backward(loss)
-            model.step()
-            end = time.time()
-            if torch.distributed.get_rank() == 0:
-                print_throughput(model.model, args, end - start,
-                                 args.global_rank)
+            f"step {step}, progress: {(step*1.0)/(args.num_train_epochs * num_update_steps_per_epoch)}", args.global_rank)
 
-        # Evaluate perplexity on the validation set.
-        if args.is_eval:
-            print_rank_0(
-                f"***** Evaluating perplexity, Epoch {epoch+1}/{args.num_train_epochs} *****",
-                args.global_rank)
-            perplexity, eval_loss = evaluation(model, eval_dataloader)
-            print_rank_0(f"ppl: {perplexity}, loss: {eval_loss}", args.global_rank)
-        model.tput_timer.update_epoch_count()
+        loss = engine.train_batch(data_iter=train_dataloader)
+        end1 = time.time()
+        if args.print_loss:
+            print(
+                f"step: {step}, Rank: {torch.distributed.get_rank()}, loss = {loss}, time comsumed = {end1-start1}"
+            )
+
+        if (step + 1) % args.save_model_step == 0:
+            print(f"Saving at step {step}")
+            engine.save_checkpoint(args.output_dir)
+            if args.global_rank == 0:
+                tokenizer.save_vocabulary(args.output_dir)
+                CONFIG_NAME = "config.json"
+                output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+                model.config.to_json_file(output_config_file)
 
     if args.output_dir is not None:
         print_rank_0('saving the final model ...', args.global_rank)
-        model = convert_lora_to_linear_layer(model)
+        engine.save_checkpoint(args.output_dir)
 
-        if args.global_rank == 0:
-            save_hf_format(model, tokenizer, args)
+    torch.distributed.barrier(device_ids=[args.global_rank])
+    print(f"finished saving model")
 
-        if args.zero_stage == 3:
-            # For zero stage 3, each gpu only has a part of the model, so we need a special save function
-            save_zero_three_model(model,
-                                  args.global_rank,
-                                  args.output_dir,
-                                  zero_stage=args.zero_stage)
-
+    if args.global_rank == 0:
+        tokenizer.save_vocabulary(args.output_dir)
+        CONFIG_NAME = "config.json"
+        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+        model.config.to_json_file(output_config_file)
+        print(f"finished save vocabulary config and model config")
+    torch.distributed.barrier(device_ids=[args.global_rank])
+    print(f"done after sync, will exit programm ")
 
 if __name__ == "__main__":
     main()

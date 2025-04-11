@@ -8,15 +8,14 @@
 OUTPUT=$1
 ZERO_STAGE=$2
 if [ "$OUTPUT" == "" ]; then
-    OUTPUT=./output
+    OUTPUT=/ssd/output_test_202504111304
 fi
 if [ "$ZERO_STAGE" == "" ]; then
     ZERO_STAGE=0
 fi
 mkdir -p $OUTPUT
 
-deepspeed --num_gpus 3 main.py --model_name_or_path facebook/opt-1.3b \
-   --gradient_accumulation_steps 8 --lora_dim 128 --zero_stage $ZERO_STAGE \
-   --enable_tensorboard \
-   --tensorboard_path $OUTPUT \
-   --deepspeed --output_dir $OUTPUT &> $OUTPUT/training.log
+CUDA_VISIBLE_DEVICES=0,1;DS_SKIP_CUDA_CHECK=1 deepspeed --include localhost:1 --master_port 5524 main_pipeline.py \
+ --enable_tensorboard \
+ --tensorboard_path $OUTPUT \
+ --output_dir $OUTPUT &> $OUTPUT/training.log

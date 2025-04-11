@@ -7,6 +7,11 @@ from datasets import load_dataset, load_from_disk
 from torch.utils.data import Subset
 import re
 
+#luke
+from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizer
+from typing import Any, Callable, Optional, Sequence, TypeVar, Union
+
 
 # The template prompt dataset class that all new dataset porting needs to
 # follow in order to have a unified API and unified data format.
@@ -770,3 +775,297 @@ class LmqgQagjaquadDataset(PromptRawDataset):
             f"Warning: dataset {self.dataset_name} does not include rejected response."
         )
         return None
+
+#new base class of dataset
+# The template prompt dataset class that all new dataset porting needs to
+# follow in order to have a unified API and unified data format.
+class MessageRawDataset(object):
+
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        self.output_path = output_path
+        self.seed = seed
+        self.local_rank = local_rank
+        if os.path.exists(dataset_name):
+            self.raw_datasets = load_from_disk(dataset_name)
+        elif not dataset_name == 'local/jsonfile':
+            self.raw_datasets = load_dataset(dataset_name)
+
+    def get_train_data(self):
+        return
+
+    def get_eval_data(self):
+        return
+
+    # # The prompt should be in the format of: " Human: " + actual_prompt_sentence + " Assistant:"
+    # def get_prompt(self, sample):
+    #     return
+
+    # # The chosen response should be in the format of: " " + actual_response_sentence
+    # def get_chosen(self, sample):
+    #     return
+    #
+    # # The rejected response should be in the format of: " " + actual_response_sentence
+    # # If the dataset does not have rejected response, return None
+    # def get_rejected(self, sample):
+    #     return
+    #
+    def get_prompt_and_chosen(self, sample, tokenizer):
+        return
+
+    # def get_prompt_and_rejected(self, sample):
+    #     return
+    #
+
+class LukedaiTestDataset(MessageRawDataset):
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        super().__init__(output_path, seed, local_rank, dataset_name)
+        self.dataset_name = "lukedai/test"
+        self.dataset_name_clean = "lukedai_test"
+        # self.tokenizer = AutoTokenizer.from_pretrained(  #?????????????????????????????
+        #     # "facebook/opt-1.3b",
+        #     "Qwen/Qwen2.5-0.5B-Instruct",
+        #     revision= "main",
+        #     trust_remote_code=True,
+        # )
+        # self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def get_train_data(self):
+        return self.raw_datasets["train"]
+
+    def get_eval_data(self):
+        if "test" in self.raw_datasets:
+            return self.raw_datasets["test"]
+        else:
+            return self.raw_datasets["train"]  #?????????
+
+    # def get_prompt(self, sample):
+    #     return sample['prompt']
+    #
+    # def get_chosen(self, sample):
+    #     return sample['chosen']
+    #
+    # def get_rejected(self, sample):
+    #     return sample['rejected']
+
+    def get_prompt_and_chosen(self, sample, tokenizer):
+        # dataset = dataset.map(
+        #     maybe_apply_chat_template,
+        #     fn_kwargs={"tokenizer": processing_class},
+        #     remove_columns="messages" if "messages" in dataset.column_names else None,  # renamed to "text"
+        #     **map_kwargs,
+        # )
+
+        result = maybe_apply_chat_template((sample), tokenizer=tokenizer)
+        return result
+
+    # def get_prompt_and_rejected(self, sample):
+    #     return sample['prompt'] + sample['rejected']
+
+class Openr1Openr1math220kDataset(MessageRawDataset):
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        super().__init__(output_path, seed, local_rank, dataset_name)
+        self.dataset_name = "open-r1/OpenR1-Math-220k"
+        self.dataset_name_clean = "open-r1_OpenR1-Math-220k"
+        # self.tokenizer = AutoTokenizer.from_pretrained(  #?????????????????????????????
+        #     # "facebook/opt-1.3b",
+        #     "Qwen/Qwen2.5-0.5B-Instruct",
+        #     revision= "main",
+        #     trust_remote_code=True,
+        # )
+        # self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def get_train_data(self):
+        return self.raw_datasets["train"]
+
+    def get_eval_data(self):
+        if "test" in self.raw_datasets:
+            return self.raw_datasets["test"]
+        else:
+            return self.raw_datasets["train"]  #?????????
+
+    # def get_prompt(self, sample):
+    #     return sample['prompt']
+    #
+    # def get_chosen(self, sample):
+    #     return sample['chosen']
+    #
+    # def get_rejected(self, sample):
+    #     return sample['rejected']
+
+    def get_prompt_and_chosen(self, sample, tokenizer):
+        # dataset = dataset.map(
+        #     maybe_apply_chat_template,
+        #     fn_kwargs={"tokenizer": processing_class},
+        #     remove_columns="messages" if "messages" in dataset.column_names else None,  # renamed to "text"
+        #     **map_kwargs,
+        # )
+
+        result = maybe_apply_chat_template((sample), tokenizer=tokenizer)
+        return result
+
+
+
+def maybe_apply_chat_template(
+    example: dict[str, list[dict[str, str]]],
+    tokenizer: PreTrainedTokenizer,
+    tools: Optional[list[Union[dict, Callable]]] = None,
+    is_output_dict: bool = False
+) -> dict[str, str]:
+
+    if is_conversational(example):
+        return apply_chat_template(example, tokenizer, tools, is_output_dict)
+    else:
+        return example
+
+
+def is_conversational(example: dict[str, Any]) -> bool:
+    r"""
+    Check if the example is in a conversational format.
+
+    Args:
+        example (`dict[str, Any]`):
+            A single data entry of a dataset. The example can have different keys depending on the
+            dataset type.
+
+    Returns:
+        `bool`: `True` if the data is in a conversational format, `False` otherwise.
+
+    Examples:
+
+    ```python
+    >>> example = {"prompt": [{"role": "user", "content": "What color is the sky?"}]}
+    >>> is_conversational(example)
+    True
+    >>> example = {"prompt": "The sky is"})
+    >>> is_conversational(example)
+    False
+    ```
+    """
+    supported_keys = ["prompt", "chosen", "rejected", "completion", "messages"]
+    example_keys = {key for key in example.keys() if key in supported_keys}
+
+    # It must have one of the supported keys
+    if example_keys:
+        key = example_keys.pop()  # take the first supported key
+        maybe_messages = example[key]
+        # It must be a list of messages,
+        if isinstance(maybe_messages, list):
+            maybe_message = maybe_messages[0]
+            # Each message must a list of dictionaries with keys "role" and "content"
+            if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
+                return True
+
+    return False
+
+
+
+def apply_chat_template(
+    example: dict[str, list[dict[str, str]]],
+    tokenizer: PreTrainedTokenizer,
+    tools: Optional[list[Union[dict, Callable]]] = None,
+    is_output_dict: bool = False
+) -> dict[str, str]:
+    r"""
+    Apply a chat template to a conversational example along with the schema for a list of functions in `tools`.
+
+    For more details, see [`maybe_apply_chat_template`].
+    """
+    # Check that the example has the correct keys
+    supported_keys = ["prompt", "chosen", "rejected", "completion", "messages", "label"]
+    example_keys = {key for key in example.keys() if key in supported_keys}
+    if example_keys not in [
+        {"messages"},  # language modeling
+        {"prompt"},  # prompt-only
+        {"prompt", "completion"},  # prompt-completion
+        {"prompt", "chosen", "rejected"},  # preference
+        {"chosen", "rejected"},  # preference with implicit prompt
+        {"prompt", "completion", "label"},  # unpaired preference
+    ]:
+        raise KeyError(f"Invalid keys in the example: {example_keys}")
+
+    # Apply the chat template to the whole conversation
+    if "messages" in example:
+        messages = tokenizer.apply_chat_template(example["messages"], tools=tools, tokenize=False)
+
+    # Apply the chat template to the prompt, adding the generation prompt
+    if "prompt" in example:
+        last_role = example["prompt"][-1]["role"]
+        if last_role == "user":
+            add_generation_prompt = True
+            continue_final_message = False
+        elif last_role == "assistant":
+            add_generation_prompt = False
+            continue_final_message = True
+        else:
+            raise ValueError(f"Invalid role in the last message: {last_role}")
+        prompt = tokenizer.apply_chat_template(
+            example["prompt"],
+            tools=tools,
+            continue_final_message=continue_final_message,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+    # Apply the chat template to the entire prompt + completion
+    if "prompt" in example:  # explicit prompt and prompt-completion case
+        if "chosen" in example:
+            prompt_chosen = tokenizer.apply_chat_template(
+                example["prompt"] + example["chosen"], tools=tools, tokenize=False
+            )
+            chosen = prompt_chosen[len(prompt) :]
+        if "rejected" in example and "prompt" in example:  # explicit prompt
+            prompt_rejected = tokenizer.apply_chat_template(
+                example["prompt"] + example["rejected"], tools=tools, tokenize=False
+            )
+            rejected = prompt_rejected[len(prompt) :]
+        if "completion" in example:
+            prompt_completion = tokenizer.apply_chat_template(
+                example["prompt"] + example["completion"], tools=tools, tokenize=False
+            )
+            completion = prompt_completion[len(prompt) :]
+    else:  # implicit prompt case
+        if "chosen" in example:
+            chosen = tokenizer.apply_chat_template(example["chosen"], tools=tools, tokenize=False)
+        if "rejected" in example:
+            rejected = tokenizer.apply_chat_template(example["rejected"], tools=tools, tokenize=False)
+
+    # Ensure that the prompt is the initial part of the prompt-completion string
+    if "prompt" in example:
+        error_message = (
+            "The chat template applied to the prompt + completion does not start with the chat template applied to "
+            "the prompt alone. This can indicate that the chat template is not supported by TRL."
+            "\n**Prompt**:\n{}\n\n**Prompt + Completion**:\n{}"
+        )
+        if "chosen" in example and not prompt_chosen.startswith(prompt):
+            raise ValueError(error_message.format(prompt, prompt_chosen))
+        if "rejected" in example and not prompt_rejected.startswith(prompt):
+            raise ValueError(error_message.format(prompt, prompt_rejected))
+        if "completion" in example and not prompt_completion.startswith(prompt):
+            raise ValueError(error_message.format(prompt, prompt_completion))
+
+    # Extract the completion by removing the prompt part from the prompt-completion string
+    # output = {}
+    # if "messages" in example:
+    #     output["text"] = messages
+    # if "prompt" in example:
+    #     output["prompt"] = prompt
+    # if "chosen" in example:
+    #     output["chosen"] = chosen
+    # if "rejected" in example:
+    #     output["rejected"] = rejected
+    # if "completion" in example:
+    #     output["completion"] = completion
+    # if "label" in example:
+    #     output["label"] = example["label"]
+
+
+
+    if not is_output_dict:
+        return messages
+    else:
+        output = {}
+        output["text"] = messages
+        return output
+
+
+

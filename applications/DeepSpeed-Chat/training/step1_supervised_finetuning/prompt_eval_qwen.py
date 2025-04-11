@@ -7,12 +7,13 @@ import logging
 import torch
 
 from transformers import (
-    AutoModelForCausalLM, )
+    AutoModelForCausalLM, AutoTokenizer, )
 
 from dschat.utils.model.model_utils import create_hf_model
 from dschat.utils.utils import load_hf_tokenizer
 from deepspeed import get_accelerator
-
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 logger = logging.getLogger(__name__)
 
 
@@ -21,7 +22,11 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path_baseline",
         type=str,
-        default="Qwen/Qwen2.5-0.5B-Instruct",
+        # default="Qwen/Qwen2.5-0.5B-Instruct",
+        # default="/home/luke/distributed_machine_learning/DeepSpeedExamples/applications/DeepSpeed-Chat/training/step1_supervised_finetuning/output_test_202503131848",
+        # default="/home/luke/distributed_machine_learning/DeepSpeedExamples/applications/DeepSpeed-Chat/training/step1_supervised_finetuning/output_test_202503162329",
+        default = "lukedai/Qwen2.5-1.5B-Open-R1-Distill-sft-v2",
+        # default = "Qwen/Qwen2.5-1.5B-Instruct",
         help="Path to baseline model",
         # required=True,
     )
@@ -32,6 +37,19 @@ def parse_args():
         help="Path to pretrained model",
         # required=True,
     )
+
+
+    parser.add_argument(
+        "--model_name_or_path_finetuneC",
+        type=str,
+        # default="lukedai/Qwen2.5-1.5B-Open-R1-Distill",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="Path to pretrained model",
+        # required=True,
+    )
+
+
+
     parser.add_argument(
         "--num_beams",
         type=int,
@@ -90,17 +108,26 @@ def generate(model,
              do_sample=False,
              num_return_sequences=1,
              max_new_tokens=100):
-
-    generate_ids = model.generate(inputs.input_ids,
-                                  num_beams=num_beams,
-                                  num_beam_groups=num_beam_groups,
-                                  do_sample=do_sample,
-                                  num_return_sequences=num_return_sequences,
-                                  max_new_tokens=max_new_tokens)
-
-    result = tokenizer.batch_decode(generate_ids,
-                                    skip_special_tokens=True,
-                                    clean_up_tokenization_spaces=False)
+    generate_ids = model.generate(
+        **inputs,
+        max_new_tokens=2048
+    )
+    # generate_ids = model.generate(inputs.input_ids,
+    #                               num_beams=num_beams,
+    #                               num_beam_groups=num_beam_groups,
+    #                               do_sample=do_sample,
+    #                               num_return_sequences=num_return_sequences,
+    #                               max_new_tokens=max_new_tokens)
+    # generate_ids = [
+    #     output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generate_ids)
+    # ]
+    generate_ids = [
+        output_ids[0:] for input_ids, output_ids in zip(inputs.input_ids, generate_ids)
+    ]
+    result = tokenizer.batch_decode(generate_ids, skip_special_tokens=True)[0]
+    # result = tokenizer.batch_decode(generate_ids,
+    #                                 skip_special_tokens=True,
+    #                                 clean_up_tokenization_spaces=False)
     return result
 
 
@@ -125,17 +152,30 @@ def generate_constrastive_search(model,
 
 
 def print_utils(gen_output):
-    for i in range(len(gen_output)):
-        print()
-        print(gen_output[i])
-        print()
+    # if len(gen_output.shape())==2:
+    #     for i in range(len(gen_output)):
+    #         print()
+    #         print(gen_output[i])
+    #         print()
+    # else:
+    print(gen_output)
 
-
-def prompt_eval(args, model_baseline, model_fintuned, tokenizer, device,
+def prompt_eval(args, model_baseline, model_fintuned, model_fintunedC, tokenizer, tokenizerB, tokenizerC, device,
                 prompts):
     for prompt in prompts:
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        print("==========Baseline A: ===========")
+        messages = [
+            {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ]
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        inputs = tokenizer([text], return_tensors="pt").to(device)
+        # inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        print("+++++++++++++++++++++++++++++++")
+        print("\n\n\n\n==========Baseline A: =========")
         r_base = generate(model_baseline,
                           tokenizer,
                           inputs,
@@ -143,14 +183,37 @@ def prompt_eval(args, model_baseline, model_fintuned, tokenizer, device,
                           num_return_sequences=args.num_return_sequences,
                           max_new_tokens=args.max_new_tokens)
         print_utils(r_base)
-        print("==========finetune B: =============")
+        print("==========finetune B: =========")
+        text = tokenizerB.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        inputs = tokenizerB([text], return_tensors="pt").to(device)
+
         r_finetune_g = generate(model_fintuned,
-                                tokenizer,
+                                tokenizerB,
                                 inputs,
                                 num_beams=1,
                                 num_return_sequences=args.num_return_sequences,
                                 max_new_tokens=args.max_new_tokens)
         print_utils(r_finetune_g)
+        print("\n\n\n\n==========Baseline C: =========")
+        text = tokenizerC.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        inputs = tokenizerC([text], return_tensors="pt").to(device)
+
+        r_finetune_c = generate(model_fintunedC,
+                          tokenizer,
+                          inputs,
+                          num_beams=1,
+                          num_return_sequences=args.num_return_sequences,
+                          max_new_tokens=args.max_new_tokens)
+        print_utils(r_finetune_c)
+
         # Note: we use the above simplest greedy search as the baseline. Users can also use other baseline methods,
         # such as beam search, multinomial sampling, and beam-search multinomial sampling.
         # We provide examples as below for users to try.
@@ -190,8 +253,8 @@ def prompt_eval(args, model_baseline, model_fintuned, tokenizer, device,
         #                                             max_new_tokens=args.max_new_tokens)
         # print_utils(r_finetune_c)
         print("====================prompt end=============================")
-        print("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&")
-        print("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&\n\n")
+        print("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&")
+        print("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&")
 
 
 def main():
@@ -201,19 +264,44 @@ def main():
 
     args.end_of_conversation_token = "<|endoftext|>"
     additional_special_tokens = args.end_of_conversation_token if args.add_eot_token else None
-    tokenizer = load_hf_tokenizer(args.model_name_or_path_baseline,
+
+    model_baseline = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path_baseline,
+        torch_dtype="auto",
+        device_map="auto"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path_baseline)
+
+    # tokenizer = load_hf_tokenizer(args.model_name_or_path_baseline,
+    #                               fast_tokenizer=True,
+    #                               # add_special_tokens=additional_special_tokens
+    #                               )
+    #
+    # model_baseline = create_hf_model(AutoModelForCausalLM,
+    #                                  args.model_name_or_path_baseline,
+    #                                  tokenizer, None)
+    #
+    tokenizerB = load_hf_tokenizer(args.model_name_or_path_finetune,
                                   fast_tokenizer=True,
                                   add_special_tokens=additional_special_tokens)
 
-    model_baseline = create_hf_model(AutoModelForCausalLM,
-                                     args.model_name_or_path_baseline,
-                                     tokenizer, None)
     model_fintuned = create_hf_model(AutoModelForCausalLM,
                                      args.model_name_or_path_finetune,
                                      tokenizer, None)
 
+
+
+    tokenizerC = load_hf_tokenizer(args.model_name_or_path_finetuneC,
+                                  fast_tokenizer=True,
+                                  add_special_tokens=additional_special_tokens)
+
+    model_fintunedC = create_hf_model(AutoModelForCausalLM,
+                                     args.model_name_or_path_finetuneC,
+                                     tokenizerC, None)
+
     model_baseline.to(device)
     model_fintuned.to(device)
+    model_fintunedC.to(device)
 
     # One observation: if the prompt ends with a space " ", there is a high chance that
     # the original model (without finetuning) will stuck and produce no response.
@@ -221,12 +309,19 @@ def main():
     # to make it a more meaningful comparison.
     if args.language == "English":
         prompts = [
-            "Human: Please tell me about Microsoft in a few sentence? Assistant:",
-            "Human: Explain the moon landing to a 6 year old in a few sentences. Assistant:",
-            "Human: Write a short poem about a wise frog. Assistant:",
-            "Human: Who was president of the United States in 1955? Assistant:",
-            "Human: How does a telescope work? Assistant:",
-            "Human: Why do birds migrate south for the winter? Assistant:",
+            # "Please tell me about Microsoft in a few sentence?",
+            # "Explain the moon landing to a 6 year old in a few sentences.",
+            # "Write a short poem about a wise frog.",
+            "Who was president of the United States in 1955?",
+            "How does a telescope work?",
+            "Why do birds migrate south for the winter?",
+            "A ship traveling along a river has covered 24km\
+             upstream and 28km downstream. For this journey, \
+             it took half an hour less than for traveling 30km \
+             upstream and 21km downstream, or half an hour more \
+             than for traveling 15km upstream and 42km downstream, \
+             assuming that both the ship and the river move uniformly.\
+             Determine the speed of the ship in still water and the speed of the river."
             # "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhy do birds migrate south for the winter?<|im_end|>\n<|im_start|>assistant"
 
         ]
@@ -248,7 +343,7 @@ def main():
             "Human: 鳥が冬に南に移動するのはなぜですか? Assistant:"
         ]
 
-    prompt_eval(args, model_baseline, model_fintuned, tokenizer, device,
+    prompt_eval(args, model_baseline, model_fintuned, model_fintunedC, tokenizer,tokenizerB,tokenizerC, device,
                 prompts)
 
 

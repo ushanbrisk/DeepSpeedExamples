@@ -17,11 +17,19 @@ from itertools import chain
 from dschat.utils.data import raw_datasets
 from deepspeed.accelerator import get_accelerator
 
+from dschat.utils.data.raw_datasets import maybe_apply_chat_template
+
 
 def get_raw_dataset(dataset_name, output_path, seed, local_rank):
 
     if "Dahoas/rm-static" in dataset_name:
         return raw_datasets.DahoasRmstaticDataset(output_path, seed,
+                                                  local_rank, dataset_name)
+    elif "lukedai/test" in dataset_name:
+        return raw_datasets.LukedaiTestDataset(output_path, seed,
+                                                  local_rank, dataset_name)
+    elif "open-r1/OpenR1-Math-220k" in dataset_name:
+        return raw_datasets.Openr1Openr1math220kDataset(output_path, seed,
                                                   local_rank, dataset_name)
     elif "Dahoas/full-hh-rlhf" in dataset_name:
         return raw_datasets.DahoasFullhhrlhfDataset(output_path, seed,
@@ -153,7 +161,7 @@ class PromptDataset(Dataset):
                 self.chosen_dataset[idx]["input_ids"],
                 "attention_mask":
                 self.chosen_dataset[idx]["attention_mask"],
-                "labels":
+                "labels":  #needs to consider, when packing, input_ids is less than max_seq_len, and labels the same; but after collator, input_ids is padded, but label not
                 torch.where(self.chosen_dataset[idx]["attention_mask"].bool(),
                             self.chosen_dataset[idx]["input_ids"], -100)
             }
@@ -174,9 +182,10 @@ def create_dataset_split(current_dataset, raw_dataset, train_phase, tokenizer,
         for i, tmp_data in enumerate(current_dataset):
             # tokenize the text
             chosen_sentence = raw_dataset.get_prompt_and_chosen(
-                tmp_data)  # the accept response
+                tmp_data, tokenizer)  # the accept response
             if chosen_sentence is not None:
-                chosen_sentence += end_of_conversation_token
+                if end_of_conversation_token not in chosen_sentence:
+                    chosen_sentence += end_of_conversation_token
                 chosen_token = tokenizer(chosen_sentence,
                                          max_length=max_seq_len,
                                          padding="max_length",
@@ -380,7 +389,8 @@ def create_prompt_dataset(local_rank,
         torch.save(train_dataset, train_fname)
         torch.save(eval_dataset, eval_fname)
     torch.distributed.barrier()
-    return torch.load(train_fname), torch.load(eval_fname)
+    # return torch.load(train_fname, weights_only=True), torch.load(eval_fname,weights_only=True)  #modifed 20250402 , weights_only=true
+    return torch.load(train_fname), torch.load(eval_fname)  #modifed 20250402 , weights_only=true
 
 
 class DataCollatorReward:
@@ -532,3 +542,250 @@ class MiniDataset:
 
     def free(self):
         self.dataset = []
+
+
+#
+# #????train_phase=1???
+# def create_dataset_2(local_rank, dataset_name, data_split, output_path,
+#                    train_phase, seed, tokenizer, end_of_conversation_token,
+#                    max_seq_len, rebuild):
+#     raw_dataset = get_raw_dataset(dataset_name, output_path, seed, local_rank)
+#
+#     #train dataset
+#     train_dataset = raw_dataset.get_train_data()
+#     map_kwargs = {}
+#     map_kwargs["num_proc"] = 10 #here is the parallel process number
+#     map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
+#     train_dataset = train_dataset.map(maybe_apply_chat_template,fn_kwargs={"tokenizer": tokenizer, "is_output_dict":True},**map_kwargs)
+#     map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
+#     train_dataset = train_dataset.map(lambda ex: tokenizer(ex["text"]), **map_kwargs)
+#     train_index = get_raw_dataset_split_index(local_rank, output_path,
+#                                               raw_dataset.dataset_name_clean,
+#                                               seed, "train", data_split,
+#                                               train_phase - 1,
+#                                               len(train_dataset), rebuild)
+#     train_dataset = Subset(train_dataset, train_index)
+#     prompt_dataset = []
+#     chosen_dataset = []
+#     reject_dataset = []
+#     for i, tmp_data in enumerate(train_dataset):#??current_dataset?????
+#         chosen_dataset.append({'input_ids':torch.Tensor(tmp_data['input_ids']), 'attention_mask':torch.Tensor(tmp_data['attention_mask'])})
+#     train_dataset = PromptDataset(prompt_dataset, chosen_dataset, reject_dataset,
+#                          tokenizer.pad_token_id, train_phase)
+#
+#     #eval dataset
+#     eval_dataset = raw_dataset.get_eval_data()
+#     map_kwargs = {}
+#     map_kwargs["num_proc"] = 10 #here is the parallel process number
+#     map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
+#     eval_dataset = eval_dataset.map(maybe_apply_chat_template,fn_kwargs={"tokenizer": tokenizer, "is_output_dict":True},**map_kwargs)
+#     map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
+#     eval_dataset = eval_dataset.map(lambda ex: tokenizer(ex["text"]), **map_kwargs)
+#     eval_index = get_raw_dataset_split_index(local_rank, output_path,
+#                                               raw_dataset.dataset_name_clean,
+#                                               seed, "eval", data_split,
+#                                               train_phase - 1,
+#                                               len(eval_dataset), rebuild)
+#
+#     eval_dataset = Subset(eval_dataset, eval_index)
+#     prompt_dataset = []
+#     chosen_dataset = []
+#     reject_dataset = []
+#     for i, tmp_data in enumerate(eval_dataset):#??current_dataset?????
+#         chosen_dataset.append({'input_ids':torch.Tensor(tmp_data['input_ids']), 'attention_mask':torch.Tensor(tmp_data['attention_mask'])})
+#     eval_dataset = PromptDataset(prompt_dataset, chosen_dataset, reject_dataset,
+#                          tokenizer.pad_token_id, train_phase)
+#     return train_dataset, eval_dataset
+#
+
+def create_prompt_dataset_2(local_rank,
+                          data_path,
+                          data_split,
+                          output_path,
+                          train_phase,
+                          seed,
+                          tokenizer,
+                          max_seq_len,
+                          end_of_conversation_token="<|endoftext|>",
+                          sft_only_data_path=[],
+                          reload=False):
+    """
+    Creates the prompt dataset
+    """
+    tokenizer_name = tokenizer.init_kwargs["name_or_path"].replace("/", "_")
+
+    if local_rank >= 0:
+        print(f'Creating prompt dataset {data_path}, {reload=}')
+        if len(data_path) == 1:  # Single dataset.
+            train_dataset = create_dataset_2(
+                local_rank,
+                data_path[0],
+                data_split,
+                output_path,
+                train_phase,
+                seed,
+                tokenizer,
+                end_of_conversation_token,
+                max_seq_len,
+                rebuild=reload)
+        print(f'finish read dataset')
+    return train_dataset
+
+#????train_phase=1???
+def create_dataset_2(local_rank, dataset_name, data_split, output_path,
+                   train_phase, seed, tokenizer, end_of_conversation_token,
+                   max_seq_len, rebuild):
+    raw_dataset = get_raw_dataset(dataset_name, output_path, seed, local_rank)
+    print("finished get raw_data\n")
+    #train dataset
+    train_dataset = raw_dataset.get_train_data()
+    train_dataset = train_dataset.select_columns(['messages'])
+    del raw_dataset
+    print("finished selecting message column")
+
+    map_kwargs = {}
+    map_kwargs["num_proc"] = 52 #here is the parallel process number
+    map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
+    train_dataset = train_dataset.map(maybe_apply_chat_template,fn_kwargs={"tokenizer": tokenizer, "is_output_dict":True},**map_kwargs)
+    print("finish maybe_apply_chat_template() to all data\n")
+    train_dataset = train_dataset.select_columns(['text'])
+    map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
+    map_kwargs["num_proc"] = 52
+    train_dataset = train_dataset.map(lambda ex: tokenizer(ex["text"]), **map_kwargs)
+    print("finish tokenizering all data\n")
+
+    train_dataset = train_dataset.select_columns("input_ids")
+    map_kwargs["desc"] = f"Packing {dataset_name} dataset"
+    # import os
+    # print(f"os pid: {os.getpid()}")
+    train_dataset = train_dataset.map(
+        pack_examples, batched=True, fn_kwargs={"seq_length": max_seq_len}, **map_kwargs
+    )
+    # train_dataset["input_ids"]=torch.Tensor(train_dataset["input_ids"])
+    #remove this split index process
+    # train_index = get_raw_dataset_split_index(local_rank, output_path,
+    #                                           raw_dataset.dataset_name_clean,
+    #                                           seed, "train", data_split,
+    #                                           train_phase - 1,
+    #                                           len(train_dataset), rebuild)
+    # print("finish creating train index\n")
+    # train_dataset = Subset(train_dataset, train_index)
+    # prompt_dataset = []
+    # chosen_dataset = []
+    # reject_dataset = []
+    # for i, tmp_data in enumerate(train_dataset):#??current_dataset????? the purpose of this action is fetch data from random selection order
+    #     # chosen_dataset.append({'input_ids':torch.Tensor(tmp_data['input_ids']), 'attention_mask':torch.Tensor(tmp_data['attention_mask'])})
+    #     # chosen_dataset.append(tmp_data['input_ids'])
+    #     chosen_dataset.append({'input_ids':tmp_data['input_ids'], 'attention_mask':tmp_data['attention_mask']})
+    #
+    #
+    # print("finish gather all [dict()] data to chosen_dataset\n" )
+    # from datasets.arrow_dataset import Dataset
+    # chosen_dataset = Dataset.from_list(chosen_dataset)
+    # map_kwargs["desc"] = f"Packing {dataset_name} dataset"
+    # chosen_dataset = chosen_dataset.map(
+    #         pack_examples, batched=True, fn_kwargs={"seq_length": 512}, **map_kwargs
+    #     )
+    print("finish packing chosen_dataset\n")
+    # need to finish after vacation
+    # #??????packing, ???????????????????
+    # #?????{'input_ids': [[1, 2, 3, 4, 5], [6, 7, 8]], 'attention_mask': [[0, 1, 1, 0, 0], [1, 1, 1]]}
+    # #?????  chosen_dataset, ?list, ???????dict('input_ids':xx, 'attention_mask':xx)
+    # chosen_dataset_final=[]
+    # for i, tmp_data in enumerate(chosen_dataset):#??current_dataset????? the purpose of this action is fetch data from random selection order
+    #     # chosen_dataset.append({'input_ids':torch.Tensor(tmp_data['input_ids']), 'attention_mask':torch.Tensor(tmp_data['attention_mask'])})
+    #     # chosen_dataset.append(tmp_data['input_ids'])
+    #     # if len(tmp_data['input_ids']) < 512:
+    #     #     break
+    #     chosen_dataset_final.append({'input_ids':torch.tensor(tmp_data['input_ids']), 'attention_mask':torch.tensor(tmp_data['attention_mask'])})
+    # print("finish creating PromptDataset\n")
+    # #here needs to consider when input_ids and labels are shorter than max_seq_len, but input_ids will be padded in dataloader, while label not
+    # #this part needs to reconsideration
+    # train_dataset = PromptDataset(prompt_dataset, chosen_dataset_final, reject_dataset,
+    #                      tokenizer.pad_token_id, train_phase)
+    # print("finished create_dataset_2() function")
+
+    return train_dataset
+
+def pack_examples(examples: dict[str, list[list]], seq_length: int) -> dict[str, list[list]]:
+    """
+    Pack examples into chunks of size `seq_length`.
+
+    Args:
+        examples (`dict[str, list[list]]`):
+            Dictionary of examples with keys as strings and values as lists of lists.
+        seq_length (`int`):
+            Maximum sequence length.
+
+    Returns:
+        `dict[str, list[list]]`: Dictionary of examples with keys as strings and values as lists of lists.
+
+    Example:
+
+    ```python
+    >>>
+    >>> examples = {
+    ...     "input_ids": [[1, 2, 3], [4, 5, 6, 7], [8]],
+    ...     "attention_mask": [[0, 1, 1], [0, 0, 1, 1], [1]],
+    ... }
+    >>> pack_examples(examples, seq_length=5)
+    {'input_ids': [[1, 2, 3, 4, 5], [6, 7, 8]], 'attention_mask': [[0, 1, 1, 0, 0], [1, 1, 1]]}
+    >>> pack_examples(examples, seq_length=2)
+    {'input_ids': [[1, 2], [3, 4], [5, 6], [7, 8]], 'attention_mask': [[0, 1], [1, 0], [0, 1], [1, 1]]}
+    ```
+    """
+    # Join  all the values into a single list
+    examples = {k: sum(v, []) for k, v in examples.items()}
+    # Split the values into chunks of size seq_length
+    examples = {k: [v[i : i + seq_length] for i in range(0, len(v), seq_length)] for k, v in examples.items()}
+    return examples
+
+
+
+#????train_phase=1???
+#?create_dataset_2()??????enumerate, ????, ????index
+def create_dataset_3(local_rank, dataset_name, data_split, output_path,
+                   train_phase, seed, tokenizer, end_of_conversation_token,
+                   max_seq_len, rebuild):
+    raw_dataset = get_raw_dataset(dataset_name, output_path, seed, local_rank)
+    print("finished get raw_data\n")
+    #train dataset
+    train_dataset = raw_dataset.get_train_data()
+    map_kwargs = {}
+    map_kwargs["num_proc"] = 10 #here is the parallel process number
+    map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
+    train_dataset = train_dataset.map(maybe_apply_chat_template,fn_kwargs={"tokenizer": tokenizer, "is_output_dict":True},remove_columns="messages" if "messages" in train_dataset.column_names else None, **map_kwargs)
+
+    print("finish maybe_apply_chat_template() to all data\n")
+    map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
+    train_dataset = train_dataset.map(lambda ex: tokenizer(ex["text"]), **map_kwargs)
+
+    print("finish tokenizering all data\n")
+
+
+    prompt_dataset = []
+    chosen_dataset = []
+    reject_dataset = []
+    # train_dataset = train_dataset.select_columns(['input_ids', 'attention_mask'])
+    train_dataset = train_dataset.select_columns(['input_ids'])
+
+    #no longer needed
+    # train_dataset = train_dataset.map(lambda ex: {'chosen': {"input_ids":ex["input_ids"], "attention_mask":ex["attention_mask"]}})
+
+    # print("finish capsulating all data\n")
+    # from datasets.arrow_dataset import Dataset
+    # chosen_dataset = Dataset.from_list(train_dataset['chosen'])
+    # map_kwargs["desc"] = f"Applying packing to {dataset_name} dataset"
+    train_dataset = train_dataset.map(
+            pack_examples, batched=True, fn_kwargs={"seq_length": 512}, **map_kwargs
+        )
+    print("finish packing all data\n")
+    chosen_dataset_final=[]
+    for i, tmp_data in enumerate(chosen_dataset):#??current_dataset????? the purpose of this action is fetch data from random selection order
+        chosen_dataset_final.append({'input_ids':torch.tensor(tmp_data['input_ids']), 'attention_mask':torch.tensor(tmp_data['attention_mask'])})
+    print("finish capsulating all packed data\n")
+    train_dataset = PromptDataset(prompt_dataset, chosen_dataset_final, reject_dataset,
+                         tokenizer.pad_token_id, train_phase)
+    print("finish creating PromptDataset\n")
+    return train_dataset
+

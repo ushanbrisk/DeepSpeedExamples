@@ -46,7 +46,7 @@ class LinearLayer_LoRA(nn.Module):
 
         self.reset_parameters()
         # disable the original weight gradient
-        self.weight.requires_grad = False
+        self.weight.requires_grad = True
         # fuse LoRA to the original weight
         self.fuse_lora = False
 
@@ -92,9 +92,19 @@ def convert_linear_layer_to_lora(model,
                                  lora_scaling=1,
                                  lora_droppout=0):
     replace_name = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and part_module_name in name:
-            replace_name.append(name)
+    # for name, module in model.named_modules():
+    #     if isinstance(module, nn.Linear) and part_module_name in name:
+    #         replace_name.append(name)
+    if isinstance(part_module_name, str):  #????????
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear) and part_module_name in name:
+                replace_name.append(name)
+    elif isinstance(part_module_name, list):
+        for name, module in model.named_modules():
+            for candidate_module_name in part_module_name:
+                if isinstance(module, nn.Linear) and candidate_module_name in name:
+                    replace_name.append(name)
+
     for name in replace_name:
         module = recursive_getattr(model, name)
         tmp = LinearLayer_LoRA(

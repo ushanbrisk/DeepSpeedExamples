@@ -10,7 +10,11 @@ from transformers import (
     AutoModel,
 )
 from huggingface_hub import snapshot_download
-from transformers.deepspeed import HfDeepSpeedConfig
+try:
+    from transformers.deepspeed import HfDeepSpeedConfig
+except:
+    from transformers.integrations.deepspeed import HfDeepSpeedConfig
+
 
 from dschat.utils.model.reward_model import RewardModel
 from dschat.utils.utils import load_state_dict_into_model, print_rank_0
@@ -87,7 +91,10 @@ def create_hf_model(model_class,
                     tokenizer,
                     ds_config=None,
                     rlhf_training=False,
-                    dropout=None):
+                    dropout=None,
+                    resize_embedding=True,
+                    flash_attn = True,
+                    dtype='bf16'):
     model_config = AutoConfig.from_pretrained(model_name_or_path)
     configure_dropout(model_config, dropout)
 
@@ -101,16 +108,37 @@ def create_hf_model(model_class,
         # the weight loading is handled by create critic model
         model = model_class.from_config(model_config)
     else:
-        model = model_class.from_pretrained(
-            model_name_or_path,
-            from_tf=bool(".ckpt" in model_name_or_path),
-            config=model_config)
+        if flash_attn:
+
+            model = model_class.from_pretrained(
+                model_name_or_path,
+                from_tf=bool(".ckpt" in model_name_or_path),
+                config=model_config,
+                attn_implementation="flash_attention_2",  #added by luke 20250402
+                torch_dtype=torch.bfloat16,   #have not implemented chosen by args yet, wait to complish
+                # device_map="auto"
+            )
+        else:
+            model = model_class.from_pretrained(
+                model_name_or_path,
+                from_tf=bool(".ckpt" in model_name_or_path),
+                config=model_config,
+                # torch_dtype=torch.bfloat16,#have not implemented chosen by args yet, wait to complish
+            )
+            # model_base = model_class.from_pretrained(
+            #         model_name_or_path,
+            #         torch_dtype="auto",
+            #         config=model_config,
+            #         device_map="cpu"
+            #         )
 
     model.config.end_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = model.config.eos_token_id
-    model.resize_token_embeddings(int(
-        8 *
-        math.ceil(len(tokenizer) / 8.0)))  # make the vocab size multiple of 8
+
+    if resize_embedding:
+        model.resize_token_embeddings(int(
+            8 *
+            math.ceil(len(tokenizer) / 8.0)))  # make the vocab size multiple of 8
 
     return model
 
