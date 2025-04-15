@@ -789,3 +789,44 @@ def create_dataset_3(local_rank, dataset_name, data_split, output_path,
     print("finish creating PromptDataset\n")
     return train_dataset
 
+def create_prompt_dataset_0(
+        is_eval,
+        local_rank,
+        data_path,
+        data_split,
+        data_output_path,
+        train_phase,
+        seed,
+        tokenizer,
+        max_seq_len,
+        end_of_conversation_token,
+        sft_only_data_path):
+    if is_eval:
+        train_dataset, eval_dataset = create_prompt_dataset(
+            local_rank,
+            data_path,
+            data_split,
+            data_output_path,
+            train_phase,
+            seed,
+            tokenizer,
+            max_seq_len,
+            end_of_conversation_token=tokenizer.eos_token,
+            sft_only_data_path=sft_only_data_path)
+        return train_dataset, eval_dataset
+    else:
+        train_dataset = create_prompt_dataset_2(
+            local_rank,
+            data_path,
+            data_split,
+            data_output_path,
+            train_phase,
+            seed,
+            tokenizer,
+            max_seq_len,
+            end_of_conversation_token=tokenizer.eos_token,
+            sft_only_data_path=sft_only_data_path)
+        return train_dataset, None
+
+
+

@@ -35,7 +35,7 @@ class PreEmbeddingPipeLayer(torch.nn.Module):
         hidden_states = inputs_embeds   #[bz, seq_len, hidden_v]
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         cos, sin = position_embeddings
-        requires_grad_idx = torch.tensor(3).to(hidden_states.device)
+        requires_grad_idx = torch.tensor([3]).to(hidden_states.device)  #here 3 different from [3], 3 may cause error in communication
         # print(f"pid: {os.getpid()},  PreEmbedding forward() called")
         return requires_grad_idx, cos, sin, hidden_states, position_ids, cache_position, labels
 

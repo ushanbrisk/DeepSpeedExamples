@@ -103,3 +103,54 @@ def get_eval_ds_config(offload, dtype, stage=0):
         "prescale_gradients": False,
         "wall_clock_breakdown": False
     }
+
+def get_pipeline_ds_config(args):
+    ds_config = {"train_micro_batch_size_per_gpu": args.per_device_train_batch_size,
+                 "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                 # "optimizer": {
+                 #     "type": "Adam",
+                 #     "params": {
+                 #         "lr": 2e-5,
+                 #         "betas": [
+                 #             0.9,
+                 #             0.95
+                 #         ],
+                 #         "eps": 1e-8,
+                 #         "weight_decay": 5e-4
+                 #     }
+                 # },
+                 # "bfloat16": {
+                 #     "enabled": True
+                 # },
+                 "fp16": {
+                     "enabled": True,
+                     "loss_scale_window": 100},
+                 # "scheduler": {
+                 #     "type": "WarmupCosineLR",
+                 #     "params": {
+                 #         "warmup_num_steps": 10,
+                 #
+                 #     }
+                 # },
+                 "zero_optimization": {
+                     "stage": 1,
+                     "offload_optimizer": {
+                         "device": "cpu",
+                         "pin_memory": True
+                     },
+                     "allgather_partitions": True,
+                     "allgather_bucket_size": 2e8,
+                     "overlap_comm": True,
+                     "reduce_scatter": True,
+                     "reduce_bucket_size": 2e8,
+                     "contiguous_gradients": True
+                 },
+
+                 "steps_per_print": 5,
+                 "tensorboard": {
+                     "enabled": args.enable_tensorboard,
+                     "output_path": f"{args.tensorboard_path}/ds_tensorboard_logs/",
+                     "job_name": f"step1_model_tensorboard"
+                 }
+                 }
+    return ds_config

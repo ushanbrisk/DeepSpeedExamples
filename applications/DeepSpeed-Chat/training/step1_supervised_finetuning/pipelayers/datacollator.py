@@ -1,4 +1,5 @@
 import torch
+import os
 
 class DataCollatorForPromptDataset(object):
     """Collate for supervised fine-tuning."""
@@ -7,9 +8,20 @@ class DataCollatorForPromptDataset(object):
         self.max_len = max_len
 
     def __call__(self, samples):
+        #print(f" process: {os.getpid()}")
         input_ids_list, labels_list = [], []
+
+        # bz = len(samples)
+        # for idx in range(bz):
+        #     if len(samples[idx]["input_ids"]) == self.max_len:
+        #         break
+        #     else:
+        #         samples[idx]["input_ids"] = samples[idx]["input_ids"] + \
+        #             [self.tokenizer.pad_token_id] * (self.max_len -len(samples[idx]["input_ids"]))
+        #
+
         batch = pad_without_fast_tokenizer_warning(
-            self.tokenizer, samples, return_tensors="pt"
+            self.tokenizer, samples, padding='max_length',return_tensors="pt",max_length=self.max_len
         )
 
         # for instance in batch:
@@ -28,6 +40,8 @@ class DataCollatorForPromptDataset(object):
         batch["labels"] = labels
         # return ((torch.stack(input_ids_list), torch.stack(labels_list)), torch.stack(labels_list))
         return ((batch['input_ids'], batch['labels']), batch['labels'])
+
+        # return ((batch['input_ids'], batch['labels']), torch.tensor([43]))
 
 def pad_without_fast_tokenizer_warning(tokenizer, *pad_args, **pad_kwargs):
     """

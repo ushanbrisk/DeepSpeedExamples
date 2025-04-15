@@ -100,10 +100,10 @@ def create_hf_model(model_class,
 
     # Note: dschf is defined in function scope to avoid global effects
     # https://huggingface.co/docs/transformers/main_classes/deepspeed#nontrainer-deepspeed-integration
-    if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
-        dschf = HfDeepSpeedConfig(ds_config)
-    else:
-        dschf = None
+    # if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
+    #     dschf = HfDeepSpeedConfig(ds_config)
+    # else:
+    #     dschf = None
     if rlhf_training:
         # the weight loading is handled by create critic model
         model = model_class.from_config(model_config)
@@ -123,7 +123,7 @@ def create_hf_model(model_class,
                 model_name_or_path,
                 from_tf=bool(".ckpt" in model_name_or_path),
                 config=model_config,
-                # torch_dtype=torch.bfloat16,#have not implemented chosen by args yet, wait to complish
+                torch_dtype=torch.bfloat16,#have not implemented chosen by args yet, wait to complish
             )
             # model_base = model_class.from_pretrained(
             #         model_name_or_path,
