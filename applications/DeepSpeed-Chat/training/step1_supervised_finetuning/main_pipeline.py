@@ -42,8 +42,8 @@ def parse_args():
     parser.add_argument('--data_path',
                         nargs='*',
                         # default=['Dahoas/rm-static'],
-                        # default = ['lukedai/test'],
-                        default = ['open-r1/OpenR1-Math-220k'],
+                        default = ['lukedai/test'],
+                        # default = ['open-r1/OpenR1-Math-220k'],
                         help='Path to the training dataset. Accepted format:'
                         '1) a single data path, 2) multiple datasets in the'
                         'form: dataset1-path dataset2-path ...')
@@ -122,7 +122,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=2,
+        default=1,
         help=
         "Number of updates steps to accumulate before performing a backward/update pass.",
     )
@@ -238,7 +238,7 @@ def parse_args():
                         help='Prints loss at each step.')
 
     parser.add_argument('--num_stages',
-                        default=3,
+                        default=5,
                         help='pipeline stages.')
     parser.add_argument('--save_model_step',
                         default=2000,
@@ -246,6 +246,9 @@ def parse_args():
     parser.add_argument('--flash_attention',
                         default=True,
                         help='whether using flash attention.')
+    parser.add_argument('--use_liger_kernel',
+                        default=True,
+                        help='whether using liger kenel.')
 
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
@@ -285,7 +288,10 @@ def main():
                             dropout=args.dropout,
                             resize_embedding=False,
                             flash_attn = args.flash_attention,
-                            dtype=args.dtype)
+                            dtype=args.dtype,
+                            use_liger_kernel=args.use_liger_kernel)
+
+
 
 
     if args.compute_fp32_loss:
@@ -347,9 +353,11 @@ def main():
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
+    # print(model)
+
     model_pipe = PipelineModule(layers=get_model(model), num_stages=args.num_stages)
     #here, part of layers has already been moved to cuda:x, others left in cpu, in each process
-    model_pipe.to(device).half()
+    # model_pipe.to(device).half()
 
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps)
@@ -387,7 +395,9 @@ def main():
     start = time.time()
     all_loss = 0.0
 
-    print(f"rank: {args.global_rank},  process: {os.getpid()}")
+    print_mem(args.global_rank, device)
+    #clear cache of cuda
+    torch.cuda.empty_cache()
 
     for step in range(args.num_train_epochs * num_update_steps_per_epoch-1):  #-1 is importtant , abandon last residual to avoid error
         start1 = time.time()
@@ -402,20 +412,7 @@ def main():
                 f"step: {step}, Rank: {torch.distributed.get_rank()}, loss = {loss}, time comsumed = {end1-start1}"
             )
 #check mem
-        # allocated = torch.cuda.memory_allocated()  # allocated mem
-        # max_allocated = torch.cuda.max_memory_allocated()  # maximum allocated mem in history
-        # reserved = torch.cuda.memory_reserved()  # allocated + cache mem
-        # max_reserved = torch.cuda.max_memory_reserved()  # maximum allocated + cache mem in history
-        #
-        # print(f"step: {step}, Rank: {torch.distributed.get_rank()}\n"
-        #       f"Global Rank {args.global_rank} ) - "
-        #       f"Total memory: {total / (1024 ** 2)} MB, "
-        #       f"Allocated: {allocated / 1024 ** 2:.2f} MB, "
-        #       f"Max Allocated: {max_allocated / 1024 ** 2:.2f} MB, "
-        #       f"Reserved: {reserved / 1024 ** 2:.2f} MB, "
-        #       f"Max Reserved: {max_reserved / 1024 ** 2:.2f} MB"
-        #       )
-
+        print_mem(torch.distributed.get_rank(), device, f"after step {step} of training:")
         if (step + 1) % args.save_model_step == 0:
             print(f"Saving at step {step}")
             engine.save_checkpoint(args.output_dir)

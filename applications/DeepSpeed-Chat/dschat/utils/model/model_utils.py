@@ -8,6 +8,7 @@ import torch
 from transformers import (
     AutoConfig,
     AutoModel,
+    PreTrainedModel
 )
 from huggingface_hub import snapshot_download
 try:
@@ -18,6 +19,7 @@ except:
 
 from dschat.utils.model.reward_model import RewardModel
 from dschat.utils.utils import load_state_dict_into_model, print_rank_0
+from ..import_utils import is_liger_kernel_available
 
 
 def configure_dropout(model_config, dropout):
@@ -94,7 +96,8 @@ def create_hf_model(model_class,
                     dropout=None,
                     resize_embedding=True,
                     flash_attn = True,
-                    dtype='bf16'):
+                    dtype='bf16',
+                    use_liger_kernel=False):
     model_config = AutoConfig.from_pretrained(model_name_or_path)
     configure_dropout(model_config, dropout)
 
@@ -135,10 +138,30 @@ def create_hf_model(model_class,
     model.config.end_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = model.config.eos_token_id
 
-    if resize_embedding:
-        model.resize_token_embeddings(int(
-            8 *
-            math.ceil(len(tokenizer) / 8.0)))  # make the vocab size multiple of 8
+    # if resize_embedding:
+    #     model.resize_token_embeddings(int(
+    #         8 *
+    #         math.ceil(len(tokenizer) / 8.0)))  # make the vocab size multiple of 8
+
+    if use_liger_kernel:
+        if is_liger_kernel_available():
+            from liger_kernel.transformers import _apply_liger_kernel_to_instance
+
+            if isinstance(model, PreTrainedModel):
+                # Patch the model with liger kernels. Use the default kernel configurations.
+                _apply_liger_kernel_to_instance(model=model)
+            elif hasattr(model, "get_base_model") and isinstance(model.get_base_model(), PreTrainedModel):
+                # Patch the base model with liger kernels where model is a PeftModel. Use the default kernel configurations.
+                _apply_liger_kernel_to_instance(model=model.get_base_model())
+            else:
+                logger.warning(
+                    "The model is not an instance of PreTrainedModel. No liger kernels will be applied."
+                )
+        else:
+            raise ImportError(
+                "You have set `use_liger_kernel` to `True` but liger-kernel >= 0.3.0 is not available. "
+                "Please install it with `pip install liger-kernel`"
+            )
 
     return model
 

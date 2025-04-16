@@ -3,6 +3,8 @@ this code is to split qwen2.5b-1.5-instruct to multiple classes, for parallel pr
 '''
 import torch
 from deepspeed.runtime.pipe import TiedLayerSpec, LayerSpec
+from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+
 from transformers import Qwen2ForCausalLM, Qwen2Model
 import torch.nn as nn
 import os
@@ -130,8 +132,8 @@ def get_model(model):
               *[LayerSpec(DecoderPipeLayer, model=model, layer_idx=idx) for idx in
                 range(model.config.num_hidden_layers)],
               LayerSpec(NormPipeLayer, model=model),
-              TiedLayerSpec(key="embed", typename = LMHeadPipeLayer, model=model),
-              LayerSpec(LossPipeLayer, model=model)]
+              TiedLayerSpec(key="embed", typename = LMHeadLossPipeLayer, model=model),
+              ]
     return layers
 
 
@@ -155,3 +157,24 @@ def get_model(model):
 #               LayerSpec(LMHeadPipeLayer, model=model),
 #               LayerSpec(LossPipeLayer, model=model)]
 #     return layers
+
+class LMHeadLossPipeLayer(torch.nn.Module):
+    def __init__(self, model:Qwen2ForCausalLM):
+        super().__init__()
+        self.embed_tokens = model.model.embed_tokens
+        self.weight = self.embed_tokens.weight
+
+    def forward(self, ipt):
+        hidden_states, labels = ipt
+        #logits = self.lm_head(hidden_states)
+        shift_hidden_states = hidden_states[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # flatten tokens
+        shift_hidden_states = shift_hidden_states.view(-1, shift_hidden_states.shape[-1])
+        shift_labels = shift_labels.view(-1)
+
+        lce = LigerFusedLinearCrossEntropyLoss(reduction = "mean")
+        loss = lce(self.weight, shift_hidden_states, shift_labels)
+        # print(f"pid: {os.getpid()},  LMHead forward() called")
+        return loss
+

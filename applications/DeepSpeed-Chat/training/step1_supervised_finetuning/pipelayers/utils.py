@@ -7,7 +7,7 @@ def print_mem(rank, device, info='' ):
     max_reserved = torch.cuda.max_memory_reserved()  # maximum allocated + cache mem in history
 
 
-    print(f"{info}, Global Rank {rank} ) - \
+    print(f"rank:{rank},device:{device}, {info}, Global Rank {rank} ) - \
         Total memory: {total / (1024**2)} MB, \
         Allocated: {allocated / 1024**2:.2f} MB, \
         Max Allocated: {max_allocated / 1024**2:.2f} MB, \
