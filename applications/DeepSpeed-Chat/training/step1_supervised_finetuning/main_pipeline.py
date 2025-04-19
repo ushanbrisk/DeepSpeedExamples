@@ -7,6 +7,7 @@ import argparse
 import math
 import time
 import os
+import shutil
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 # from torch.utils.data.distributed import DistributedSampler
@@ -33,7 +34,7 @@ from dschat.utils.module.lora import convert_linear_layer_to_lora, convert_lora_
 from dschat.utils.model.model_utils import create_hf_model, causal_lm_model_to_fp32_loss
 # from dschat.utils.perf import print_throughput
 # from pipelayers import PreEmbeddingPipeLayer, DecoderPipeLayer, NormPipeLayer, LMHeadPipeLayer, LossPipeLayer
-from pipelayers import get_model, DataCollatorForPromptDataset, print_mem
+from pipelayers import get_model,get_model_loss_fn, DataCollatorForPromptDataset,DataCollatorForPromptDatasetDummy, print_mem, loss_fn_parent
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -42,8 +43,8 @@ def parse_args():
     parser.add_argument('--data_path',
                         nargs='*',
                         # default=['Dahoas/rm-static'],
-                        default = ['lukedai/test'],
-                        # default = ['open-r1/OpenR1-Math-220k'],
+                        # default = ['lukedai/test'],
+                        default = ['open-r1/OpenR1-Math-220k'],
                         help='Path to the training dataset. Accepted format:'
                         '1) a single data path, 2) multiple datasets in the'
                         'form: dataset1-path dataset2-path ...')
@@ -62,7 +63,7 @@ def parse_args():
     parser.add_argument(
         '--data_output_path',
         type=str,
-        default='/ssd/tmp/data_files/',
+        default='/ssd2/tmp/data_files/',
         help=
         'Where to store the data-related files such as shuffle index. This needs to be on a local storage of a node (not on a shared storage)'
     )
@@ -80,7 +81,7 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="Qwen/Qwen2.5-1.5B-Instruct",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
         help=
         "Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
@@ -88,13 +89,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=2,
+        default=4,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=2,
+        default=4,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -122,7 +123,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
+        default=5,
         help=
         "Number of updates steps to accumulate before performing a backward/update pass.",
     )
@@ -155,6 +156,7 @@ def parse_args():
                         help="local_rank for distributed training on gpus")
     parser.add_argument('--gradient_checkpointing',
                         action='store_true',
+                        default=True,
                         help='Enable HF gradient checkpointing for model.')
     parser.add_argument(
         "--dropout",
@@ -167,10 +169,10 @@ def parse_args():
                         action='store_true',
                         default=True,
                         help='Enable ZeRO Offload techniques.')
-    parser.add_argument('--dtype',
+    parser.add_argument('--torch_dtype',
                         type=str,
-                        default='bf16',
-                        choices=['fp16', 'bf16'],
+                        default='bfloat16',
+                        choices=['bfloat16', 'float16'],
                         help='Training data type')
     parser.add_argument(
         '--zero_stage',
@@ -241,14 +243,17 @@ def parse_args():
                         default=5,
                         help='pipeline stages.')
     parser.add_argument('--save_model_step',
-                        default=2000,
+                        default=2,
                         help='steps to save model checkpoint.')
     parser.add_argument('--flash_attention',
-                        default=True,
+                        default="flash_attention_2",
                         help='whether using flash attention.')
     parser.add_argument('--use_liger_kernel',
                         default=True,
                         help='whether using liger kenel.')
+    parser.add_argument('--custom_loss_fn',
+                        default=True,
+                        help='whether using loss_fn for last stage.')
 
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
@@ -281,15 +286,19 @@ def main():
     tokenizer = load_hf_tokenizer(args.model_name_or_path,
                                   fast_tokenizer=True,
                                   add_special_tokens=additional_special_tokens)
+    torch_dtype = (
+        args.torch_dtype if args.torch_dtype in ["auto", None] else getattr(torch, args.torch_dtype)
+    )
     model = create_hf_model(AutoModelForCausalLM,
                             args.model_name_or_path,
                             tokenizer,
                             ds_config,
                             dropout=args.dropout,
                             resize_embedding=False,
-                            flash_attn = args.flash_attention,
-                            dtype=args.dtype,
-                            use_liger_kernel=args.use_liger_kernel)
+                            attn_implementation = args.flash_attention,
+                            torch_dtype=torch_dtype,
+                            use_liger_kernel=args.use_liger_kernel,
+                            gradient_checkpointing = args.gradient_checkpointing)
 
 
 
@@ -333,7 +342,10 @@ def main():
     #data collator
     # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     # data_collator = DataCollatorWithPadding(tokenizer)
-    data_collator = DataCollatorForPromptDataset(tokenizer, args.max_seq_len)
+    if args.custom_loss_fn:
+        data_collator = DataCollatorForPromptDatasetDummy(tokenizer, args.max_seq_len)
+    else:
+        data_collator = DataCollatorForPromptDataset(tokenizer, args.max_seq_len)
     #data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, truncation=True)
 
     dataloader_params = {
@@ -350,18 +362,29 @@ def main():
     train_dataloader = DataLoader(train_dataset, **dataloader_params)
 
     # pipeline wrap  model
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+    # if args.gradient_checkpointing:
+    #     model.gradient_checkpointing_enable()
 
     # print(model)
-
-    model_pipe = PipelineModule(layers=get_model(model), num_stages=args.num_stages)
+    #loss = loss_fn(outputs, label)
+    if args.custom_loss_fn:
+        model_pipe = PipelineModule(layers=get_model_loss_fn(model),
+                                    num_stages=args.num_stages,
+                                    # activation_checkpoint_interval = 4
+                                    loss_fn=loss_fn_parent(model)
+                                    )
+    else:
+        model_pipe = PipelineModule(layers=get_model(model),
+                                    num_stages=args.num_stages,
+                                    # activation_checkpoint_interval = 4
+                                    )
     #here, part of layers has already been moved to cuda:x, others left in cpu, in each process
     # model_pipe.to(device).half()
 
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps)
-
+    print_rank_0(
+        f"num_update_steps_per_epoch: {num_update_steps_per_epoch}", args.global_rank)
     ########################################### optimizer and lr scheduler##########################
     # Split weights in two groups, one with weight decay and the other not.
     optimizer_grouped_parameters = get_optimizer_grouped_parameters(
@@ -412,15 +435,23 @@ def main():
                 f"step: {step}, Rank: {torch.distributed.get_rank()}, loss = {loss}, time comsumed = {end1-start1}"
             )
 #check mem
-        print_mem(torch.distributed.get_rank(), device, f"after step {step} of training:")
+        # print_mem(torch.distributed.get_rank(), device, f"after step {step} of training:")
         if (step + 1) % args.save_model_step == 0:
+            if args.global_rank == 0:
+                if engine.global_steps > args.save_model_step:
+                    pre_tag = f"global_step{engine.global_steps - args.save_model_step}"
+                    existing_folder = os.path.join(args.output_dir, pre_tag)
+                    if os.path.isdir(existing_folder):
+                        shutil.rmtree(existing_folder)
+                        print(f"remove folder {existing_folder}")
             print(f"Saving at step {step}")
             engine.save_checkpoint(args.output_dir)
-            if args.global_rank == 0:
+            if args.global_rank == 0 and engine.global_steps <= args.save_model_step:
                 tokenizer.save_vocabulary(args.output_dir)
                 CONFIG_NAME = "config.json"
                 output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
                 model.config.to_json_file(output_config_file)
+
 
     if args.output_dir is not None:
         print_rank_0('saving the final model ...', args.global_rank)

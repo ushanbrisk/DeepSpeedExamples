@@ -389,8 +389,8 @@ def create_prompt_dataset(local_rank,
         torch.save(train_dataset, train_fname)
         torch.save(eval_dataset, eval_fname)
     torch.distributed.barrier()
-    # return torch.load(train_fname, weights_only=True), torch.load(eval_fname,weights_only=True)  #modifed 20250402 , weights_only=true
-    return torch.load(train_fname), torch.load(eval_fname)  #modifed 20250402 , weights_only=true
+    return torch.load(train_fname, weights_only=False), torch.load(eval_fname,weights_only=False)  #modifed 20250402 , weights_only=true
+    # return torch.load(train_fname), torch.load(eval_fname)  #modifed 20250402 , weights_only=true
 
 
 class DataCollatorReward:
@@ -612,10 +612,27 @@ def create_prompt_dataset_2(local_rank,
     """
     Creates the prompt dataset
     """
-    tokenizer_name = tokenizer.init_kwargs["name_or_path"].replace("/", "_")
 
-    if local_rank >= 0:
+    ################
+    os.makedirs(output_path, exist_ok=True)
+    fname = "_".join(data_path)
+    tokenizer_name = tokenizer.init_kwargs["name_or_path"].replace("/", "_")
+    #depends on tokenizer, as need tokenzier text
+    fname = f"only_train_full_{fname}_tokenizer{tokenizer_name}_seqlen{max_seq_len}"
+    fname = "_".join(fname.split("/"))
+    fname = hashlib.sha256(fname.encode()).hexdigest(
+    )  # hash the file name to avoid too long file name
+    train_fname = f"{output_path}/traindata_{fname}.pt"
+
+    cache_found = os.path.isfile(train_fname)
+    buf_create_cache = torch.ByteTensor([not cache_found]).to(
+        get_accelerator().current_device_name())
+    torch.distributed.all_reduce(buf_create_cache)
+    ####
+
+    if local_rank <= 0 and (buf_create_cache.item() != 0 or reload):
         print(f'Creating prompt dataset {data_path}, {reload=}')
+
         if len(data_path) == 1:  # Single dataset.
             train_dataset = create_dataset_2(
                 local_rank,
@@ -629,7 +646,9 @@ def create_prompt_dataset_2(local_rank,
                 max_seq_len,
                 rebuild=reload)
         print(f'finish read dataset')
-    return train_dataset
+        torch.save(train_dataset, train_fname)
+    torch.distributed.barrier()
+    return torch.load(train_fname, weights_only=False) # modifed 20250402 , weights_only=true
 
 #????train_phase=1???
 def create_dataset_2(local_rank, dataset_name, data_split, output_path,

@@ -145,12 +145,23 @@ def get_pipeline_ds_config(args):
                      "reduce_bucket_size": 2e8,
                      "contiguous_gradients": True
                  },
-
+                 #"gradient_checkpointing": True,
                  "steps_per_print": 5,
                  "tensorboard": {
                      "enabled": args.enable_tensorboard,
                      "output_path": f"{args.tensorboard_path}/ds_tensorboard_logs/",
                      "job_name": f"step1_model_tensorboard"
                  }
-                 }
+            }
+    if args.custom_loss_fn:
+        ds_config["gradient_checkpointing"] = True
+
+        ds_config["activation_checkpointing"]: {
+            "partition_activations": True,
+            "cpu_checkpointing": True,
+            "contiguous_memory_optimization": True,
+            "number_checkpoints": 10,
+            "synchronize_checkpoint_boundary": True,
+            "profile": False
+        }
     return ds_config

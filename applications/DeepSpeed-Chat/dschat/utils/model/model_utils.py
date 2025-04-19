@@ -95,9 +95,10 @@ def create_hf_model(model_class,
                     rlhf_training=False,
                     dropout=None,
                     resize_embedding=True,
-                    flash_attn = True,
-                    dtype='bf16',
-                    use_liger_kernel=False):
+                    attn_implementation = "flash_attention_2",
+                    torch_dtype=torch.bfloat16,
+                    use_liger_kernel=False,
+                    gradient_checkpointing=False):
     model_config = AutoConfig.from_pretrained(model_name_or_path)
     configure_dropout(model_config, dropout)
 
@@ -111,29 +112,14 @@ def create_hf_model(model_class,
         # the weight loading is handled by create critic model
         model = model_class.from_config(model_config)
     else:
-        if flash_attn:
-
-            model = model_class.from_pretrained(
-                model_name_or_path,
-                from_tf=bool(".ckpt" in model_name_or_path),
-                config=model_config,
-                attn_implementation="flash_attention_2",  #added by luke 20250402
-                torch_dtype=torch.bfloat16,   #have not implemented chosen by args yet, wait to complish
-                # device_map="auto"
-            )
-        else:
-            model = model_class.from_pretrained(
-                model_name_or_path,
-                from_tf=bool(".ckpt" in model_name_or_path),
-                config=model_config,
-                torch_dtype=torch.bfloat16,#have not implemented chosen by args yet, wait to complish
-            )
-            # model_base = model_class.from_pretrained(
-            #         model_name_or_path,
-            #         torch_dtype="auto",
-            #         config=model_config,
-            #         device_map="cpu"
-            #         )
+        model_kwargs = dict(
+            attn_implementation=attn_implementation,
+            torch_dtype=torch_dtype,
+            use_cache=False if gradient_checkpointing else True,
+            # device_map=get_kbit_device_map() if quantization_config is not None else None,
+            # quantization_config=quantization_config,
+        )
+        model = model_class.from_pretrained(model_name_or_path, **model_kwargs)
 
     model.config.end_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = model.config.eos_token_id

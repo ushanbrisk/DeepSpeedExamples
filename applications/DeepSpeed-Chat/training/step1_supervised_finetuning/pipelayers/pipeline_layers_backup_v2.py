@@ -8,7 +8,7 @@ from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 from transformers import Qwen2ForCausalLM, Qwen2Model
 import torch.nn as nn
 import os
-
+from torch.utils.checkpoint import checkpoint
 # from inference.huggingface.zero_inference.utils import hidden_bytes
 
 '''
@@ -64,10 +64,15 @@ class DecoderPipeLayer(torch.nn.Module):
 
 
         position_embeddings = (cos, sin)
-        layer_outputs = self.layer(hidden_states,
-                                   position_ids = position_ids,
+        layer_outputs = checkpoint(self.layer, hidden_states,position_ids = position_ids,
                                    cache_position = cache_position,
-                                   position_embeddings = position_embeddings)
+                                   position_embeddings = position_embeddings,
+                                   use_reentrant = False)
+
+        # layer_outputs = self.layer(hidden_states,
+        #                            position_ids = position_ids,
+        #                            cache_position = cache_position,
+        #                            position_embeddings = position_embeddings)
 
         hidden_states = layer_outputs[0]
         # print(f"pid: {os.getpid()},  DecoderLayer.{self.layer_idx} forward() called")
@@ -80,7 +85,8 @@ class NormPipeLayer(torch.nn.Module):
 
     def forward(self, ipt):
         requires_grad_idx, cos, sin, hidden_states, position_ids, cache_position, labels = ipt
-        hidden_states = self.norm(hidden_states)
+        # hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint(self.norm, hidden_states, use_reentrant = False)
         # print(f"pid: {os.getpid()},  NormLayer forward() called")
         return hidden_states, labels
 
@@ -177,6 +183,7 @@ class LMHeadLossPipeLayerDummy(torch.nn.Module):
 
     def forward(self, ipt):
         hidden_states, labels = ipt
+
         return hidden_states
 
 class LMHeadLossPipeLayer(torch.nn.Module):
