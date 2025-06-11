@@ -57,8 +57,8 @@ def test_load_model(model_path):
 
     model_config = AutoConfig.from_pretrained(model_path)
     model = AutoModelForCausalLM.from_pretrained(model_path, config=model_config, torch_dtype=torch.bfloat16 )
-
     print(model)
+    return model, tokenizer
 
     #no using dropout in inference
     # configure_dropout(model_config, dropout)
@@ -70,9 +70,46 @@ def set_args():
     parser.add_argument('--save_model_dir', default='/ssd2/debug_20250516', type=str, help='')
     return parser.parse_args()
 
-
 if __name__ == '__main__':
     ages = set_args()
     convert_model_to_hf(ages.pipeline_model_dir, ages.save_model_dir)
 
-    test_load_model(ages.save_model_dir)
+    model, tokenizer = test_load_model(ages.save_model_dir)
+    # model = model.to("cuda:1")
+
+    # test for connecting to vllm server
+    # model = model.to(device)  #only for test, will use deepspeed.initialize() instead
+    vllm_client = None
+
+    from trl.extras.vllm_client import VLLMClient
+    from vllm import SamplingParams
+
+    #for test, comment it,
+    vllm_client = VLLMClient(
+        '0.0.0.0', 8000, connection_timeout=1200.0
+    )
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    responses = vllm_client.generate(prompts=prompts, n=4, max_tokens=32,
+                                     )
+    responses_txt = tokenizer.batch_decode(responses)
+    print("Test vllm Server Responses:", responses_txt)  # noqa
+
+    test_updating = True
+    if test_updating:
+        # test for updating model parameter
+        # For non-PEFT models, simply gather and update each parameter individually.
+        for name, param in model.named_parameters():
+            # print(f"name: {name}")
+            vllm_client.update_named_param(name, param.data)
+
+        # Reset cache on main process
+        vllm_client.reset_prefix_cache()
+
+
+#set cuda=1, model not to() any cuda, will be ok
+#do not know why there will be errors in other cases

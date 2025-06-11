@@ -10,6 +10,7 @@ import os
 import shutil
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from trl.trainer.grpo_trainer import RepeatRandomSampler
 # from torch.utils.data.distributed import DistributedSampler
 from transformers.trainer_utils import seed_worker
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
@@ -27,7 +28,7 @@ import deepspeed
 # from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from deepspeed import get_accelerator, PipelineModule
 
-from dschat.utils.data.data_utils import create_prompt_dataset_0
+from dschat.utils.data.data_utils import create_prompt_dataset_grpo, create_prompt_dataset_0
 from dschat.utils.utils import print_rank_0, to_device, save_hf_format, set_random_seed, get_all_reduce_mean, get_optimizer_grouped_parameters, save_zero_three_model, load_hf_tokenizer
 from dschat.utils.ds_utils import get_pipeline_ds_config
 from dschat.utils.module.lora import convert_linear_layer_to_lora, convert_lora_to_linear_layer, only_optimize_lora_parameters, make_model_gradient_checkpointing_compatible
@@ -35,6 +36,13 @@ from dschat.utils.model.model_utils import create_hf_model, causal_lm_model_to_f
 # from dschat.utils.perf import print_throughput
 # from pipelayers import PreEmbeddingPipeLayer, DecoderPipeLayer, NormPipeLayer, LMHeadPipeLayer, LossPipeLayer
 from pipelayers import get_model,get_model_loss_fn, DataCollatorForPromptDataset,DataCollatorForPromptDatasetDummy, print_mem, loss_fn_parent
+from grpo import get_reward_funcs, enable_gradient_checkpointing,check_module_requires_grad,PipelineGRPOEngine
+from peft import LoraConfig, PeftConfig, get_peft_model
+from accelerate.utils import is_peft_model
+from pipelayers import convert_model_to_hf, test_load_model
+from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
+
+from accelerate.utils import gather, gather_object
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -43,8 +51,8 @@ def parse_args():
     parser.add_argument('--data_path',
                         nargs='*',
                         # default=['Dahoas/rm-static'],
-                        # default = ['lukedai/test'],
-                        default = ['open-r1/OpenR1-Math-220k'],
+                        default = ['lukedai/test'],
+                        # default = ['open-r1/OpenR1-Math-220k'],
                         help='Path to the training dataset. Accepted format:'
                         '1) a single data path, 2) multiple datasets in the'
                         'form: dataset1-path dataset2-path ...')
@@ -81,7 +89,7 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="Qwen/Qwen2.5-3B-Instruct",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
         help=
         "Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
@@ -89,13 +97,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=2,
+        default=8,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=2,
+        default=8,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -158,6 +166,11 @@ def parse_args():
                         action='store_true',
                         default=True,
                         help='Enable HF gradient checkpointing for model.')
+    parser.add_argument('--use_reentrant',
+                        default=False,
+                        help='use_reentrant for gradient checkpointing for model.')
+
+
     parser.add_argument(
         "--dropout",
         type=float,
@@ -182,8 +195,8 @@ def parse_args():
     ## LoRA for efficient training setting
     parser.add_argument("--lora_dim",
                         type=int,
-                        default=16,
-                        # default = 0,
+                        # default=16,
+                        default = 0,
                         help="If > 0, use LoRA for efficient training.")
     parser.add_argument("--lora_dropout",
                         type=float,
@@ -240,12 +253,10 @@ def parse_args():
                         help='Prints loss at each step.')
 
     parser.add_argument('--num_stages',
-                        type = int,
                         default=4,
                         help='pipeline stages.')
     parser.add_argument('--save_model_step',
-                        type = int,
-                        default=200,
+                        default=10,
                         help='steps to save model checkpoint.')
     parser.add_argument('--flash_attention',
                         default="flash_attention_2",
@@ -256,6 +267,66 @@ def parse_args():
     parser.add_argument('--custom_loss_fn',
                         default=True,
                         help='whether using loss_fn for last stage.')
+
+
+
+    parser.add_argument('--reward_funcs',
+                        default=['accuracy','format','tag_count'],
+                        help='reward functions for reinforcement learning.')
+
+    parser.add_argument('--reward_weights',
+                        default=[1.0, 1.0, 1.0],
+                        help='reward functions weights for reinforcement learning.')
+
+    parser.add_argument('--num_generations',
+                        default=8,
+                        help='grpo G, number of generations for each prompt')
+
+    parser.add_argument('--max_prompt_length',
+                        default=512,
+                        help='maximum length of prompt')
+
+    parser.add_argument('--repetition_penalty',
+                        default=1.0,
+                        help='vllm parameter for penalty for repetiton')
+
+    parser.add_argument('--temperature',
+                        default=1.0,
+                        help='vllm parameter ')
+
+    parser.add_argument('--top_p',
+                        default=1.0,
+                        help='vllm parameter ')
+
+    parser.add_argument('--top_k',
+                        default=-1,
+                        help='vllm parameter ')
+
+    parser.add_argument('--min_p',
+                        default=0.0,
+                        help='vllm parameter ')
+
+    parser.add_argument('--max_completion_length',
+                        default=2048,
+                        help='vllm parameter ')
+
+
+    parser.add_argument('--num_iterations',
+                        default=1,
+                        help='repeat count for each batch data sent to training ')
+
+    parser.add_argument('--grpo_beta',
+                        default=0.0,
+                        help='beta for kl distance penalty of per_token_logps and ref_per_token_logps')
+
+    parser.add_argument('--epsilon_low',
+                        default=0.1,
+                        help='clap lower boundary for grpo loss')
+
+    parser.add_argument('--epsilon_high',
+                        default=0.1,
+                        help='clap higher boundary for grpo loss')
+
 
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
@@ -288,9 +359,18 @@ def main():
     tokenizer = load_hf_tokenizer(args.model_name_or_path,
                                   fast_tokenizer=True,
                                   add_special_tokens=additional_special_tokens)
+
+
+
+#for test
+
     torch_dtype = (
         args.torch_dtype if args.torch_dtype in ["auto", None] else getattr(torch, args.torch_dtype)
     )
+    # Get reward functions from the registry
+    reward_funcs = get_reward_funcs(args)
+    reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
+
     model = create_hf_model(AutoModelForCausalLM,
                             args.model_name_or_path,
                             tokenizer,
@@ -302,8 +382,10 @@ def main():
                             use_liger_kernel=args.use_liger_kernel,
                             gradient_checkpointing = args.gradient_checkpointing)
 
-
-
+    if args.global_rank == 0:
+        for name, param in model.named_parameters():
+            # print(f"name: {name}, param size: {param.data.shape}")
+            pass
 
     if args.compute_fp32_loss:
         print_rank_0(
@@ -311,17 +393,97 @@ def main():
             args.global_rank)
         causal_lm_model_to_fp32_loss(model)
 
-    if args.lora_dim > 0:
-        model = convert_linear_layer_to_lora(model, args.lora_module_name,
-                                             args.lora_dim,lora_scaling=args.lora_alpha, lora_droppout=args.lora_dropout)
-        if args.only_optimize_lora:
-            model = only_optimize_lora_parameters(model)
-            model = make_model_gradient_checkpointing_compatible(model)
+    ########### lora
+    # if args.lora_dim > 0:
+    #     model = convert_linear_layer_to_lora(model, args.lora_module_name,
+    #                                          args.lora_dim,lora_scaling=args.lora_alpha, lora_droppout=args.lora_dropout)
+    #     if args.only_optimize_lora:
+    #         model = only_optimize_lora_parameters(model)
+    #         model = make_model_gradient_checkpointing_compatible(model)
 
+    peft_config = LoraConfig(
+        task_type='CAUSAL_LM',
+        r=args.lora_dim,
+        target_modules=args.lora_module_name,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+    )
+    if args.lora_dim > 0:
+        model = get_peft_model(model, peft_config)
+
+    if args.global_rank == 0:
+        # print(model)
+        pass
+
+    # test for connecting to vllm server
+    model = model.to(device)  #only for test, will use deepspeed.initialize() instead
+    vllm_client = None
+    print(f"rank: {args.global_rank}")
+    if args.global_rank ==0 :
+        from trl.extras.vllm_client import VLLMClient
+        from vllm import SamplingParams
+
+        #for test, comment it,
+        vllm_client = VLLMClient(
+            '0.0.0.0', 8000, connection_timeout=1200.0
+        )
+        prompts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        responses = vllm_client.generate(prompts=prompts, n=4, max_tokens=32,
+                                         )
+        responses_txt = tokenizer.batch_decode(responses)
+        print("Test vllm Server Responses:", responses_txt)  # noqa
+
+    test_updating = True
+    if test_updating and args.global_rank == 0:
+        # test for updating model parameter
+        if is_peft_model(model):
+            model.merge_adapter()
+            for name, param in model.named_parameters():
+                name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                if model.prefix in name:
+                    continue
+                if "original_module" in name:
+                    continue
+                name = name.replace("modules_to_save.default.", "")
+                if args.global_rank == 0:
+                    vllm_client.update_named_param(name, param.data)
+                    # print(f"update param name: {name}, param size: {param.data.shape}")
+            model.unmerge_adapter()
+        else:
+        # For non-PEFT models, simply gather and update each parameter individually.
+            for name, param in model.named_parameters():
+                if args.global_rank == 0:
+                    # print(f"name: {name}")
+                    vllm_client.update_named_param(name, param.data)
+
+        # Reset cache on main process
+        if args.global_rank==0:
+            vllm_client.reset_prefix_cache()
+        #########################end of updating weight####################
+    # return
+    # print(model)
+    if args.global_rank == 0:
+        # check_module_requires_grad(model)
+        pass
+
+    #gradient_checkpointing
+    # Enable gradient checkpointing if requested
+    if args.gradient_checkpointing:
+        model = enable_gradient_checkpointing(model, args)
+
+    # return
     # Prepare the data
+
     train_phase = 1
 
-    train_dataset, eval_dataset = create_prompt_dataset_0(
+##for grpo, need _grpo func, not _0 func
+    train_dataset, eval_dataset = create_prompt_dataset_grpo(
         args.is_eval,
         args.local_rank,
         args.data_path,
@@ -334,21 +496,34 @@ def main():
         end_of_conversation_token=tokenizer.eos_token,
         sft_only_data_path=args.sft_only_data_path)
 
-
+    if "messages" in train_dataset.column_names:
+        train_dataset = train_dataset.remove_columns("messages")
 
     torch.distributed.barrier(device_ids=[args.global_rank])
 
     #data sampler
-    train_sampler = RandomSampler(train_dataset)
+    # train_sampler = RandomSampler(train_dataset)
+    batch_size_sampler = args.per_device_train_batch_size * args.gradient_accumulation_steps // args.num_generations
 
-    #data collator
-    # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-    # data_collator = DataCollatorWithPadding(tokenizer)
-    if args.custom_loss_fn:
-        data_collator = DataCollatorForPromptDatasetDummy(tokenizer, args.max_seq_len)
-    else:
-        data_collator = DataCollatorForPromptDataset(tokenizer, args.max_seq_len)
-    #data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, truncation=True)
+    train_sampler = RepeatRandomSampler(data_source=train_dataset,
+                                        mini_repeat_count=args.num_generations,
+                                        batch_size=batch_size_sampler,
+                                        repeat_count=args.num_iterations,  #
+                                        seed=123)  #here need to consider seed?
+
+# ######################### old data collator for sft   ##
+#     #data collator
+#     # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+#     # data_collator = DataCollatorWithPadding(tokenizer)
+#     if args.custom_loss_fn:
+#         data_collator = DataCollatorForPromptDatasetDummy(tokenizer, args.max_seq_len)
+#     else:
+#         data_collator = DataCollatorForPromptDataset(tokenizer, args.max_seq_len)
+#     #data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, truncation=True)
+# #############################################################
+    # Data collator for grpo
+    def data_collator(features):  # No data collation is needed in GRPO
+        return features
 
     dataloader_params = {
         "batch_size": args.per_device_train_batch_size,
@@ -371,13 +546,19 @@ def main():
     #loss = loss_fn(outputs, label)
     if args.custom_loss_fn:
         model_pipe = PipelineModule(layers=get_model_loss_fn(model),
-                                    num_stages=args.num_stages,
+                                    num_stages=int(args.num_stages),
                                     # activation_checkpoint_interval = 4
-                                    loss_fn=loss_fn_parent(model)
+                                    loss_fn=loss_fn_parent(model,
+                                                           temperature=args.temperature,
+                                                           num_iterations=args.num_iterations,
+                                                           gradient_accumulation_steps=args.gradient_accumulation_steps,
+                                                           epsilon_low=args.epsilon_low,
+                                                           epsilon_high=args.epsilon_high,
+                                                           )
                                     )
     else:
         model_pipe = PipelineModule(layers=get_model(model),
-                                    num_stages=args.num_stages,
+                                    num_stages=int(args.num_stages),
                                     # activation_checkpoint_interval = 4
                                     )
     #here, part of layers has already been moved to cuda:x, others left in cpu, in each process
@@ -407,12 +588,31 @@ def main():
     ################################################################################################
 
     #pipeline
+    pipeline_grpo_config = {'pipeline_grpo':True,
+                            'engine': PipelineGRPOEngine,
+                            'tokenizer': tokenizer,
+                            'max_prompt_length':args.max_prompt_length,
+                            'vllm_client':vllm_client,
+                            'num_generations':args.num_generations,
+                            'repetition_penalty' : args.repetition_penalty,
+                            'temperature' : args.temperature,
+                            'top_p' : args.top_p,
+                            'top_k' : args.top_k,
+                            'min_p' : args.min_p,
+                            'max_completion_length': args.max_completion_length ,
+                            'num_iterations':args.num_iterations,
+                            'grpo_beta':args.grpo_beta,
+                            'reward_funcs':reward_funcs,
+                            'reward_weights':reward_weights}
+
     engine, _, _, _ = deepspeed.initialize(model=model_pipe,
                                            optimizer=optimizer,
                                            config=ds_config,
                                            model_parameters=model_pipe.parameters(),
                                            lr_scheduler = lr_scheduler,
+                                           pipeline_grpo_config=pipeline_grpo_config
                                            )
+
 
     train_dataloader = iter(deepspeed.utils.RepeatingLoader(train_dataloader))
     # train_dataloader = iter(train_dataloader)
@@ -424,53 +624,38 @@ def main():
     #clear cache of cuda
     torch.cuda.empty_cache()
 
-    for step in range(args.num_train_epochs * num_update_steps_per_epoch-1):  #-1 is importtant , abandon last residual to avoid error
-        start1 = time.time()
-        print_rank_0(
-            f"step {step}, progress: {(step*1.0)/(args.num_train_epochs * num_update_steps_per_epoch)}", args.global_rank)
-
-        loss = engine.train_batch(data_iter=train_dataloader)
-        end1 = time.time()
-        # torch.cuda.empty_cache()   #clear cache, for test sd
-        if args.print_loss:
-            print(
-                f"step: {step}, Rank: {torch.distributed.get_rank()}, loss = {loss}, time comsumed = {end1-start1}"
-            )
-#check mem
-        # print_mem(torch.distributed.get_rank(), device, f"after step {step} of training:")
-        if (step + 1) % args.save_model_step == 0:
-            if args.global_rank == 0:
-                if engine.global_steps > args.save_model_step:
-                    pre_tag = f"global_step{engine.global_steps - args.save_model_step}"
-                    existing_folder = os.path.join(args.output_dir, pre_tag)
-                    if os.path.isdir(existing_folder):
-                        shutil.rmtree(existing_folder)
-                        print(f"remove folder {existing_folder}")
-            print(f"Saving at step {step}")
-            engine.save_checkpoint(args.output_dir)
-            if args.global_rank == 0 and engine.global_steps <= args.save_model_step:
-                tokenizer.save_vocabulary(args.output_dir)
-                CONFIG_NAME = "config.json"
-                output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-                model.config.to_json_file(output_config_file)
+    if args.global_rank >= 0:
+        module = engine.module
+        num_layers = len(module.forward_funcs)
+        start, end = 0, num_layers
+        layer_list = module.forward_funcs[start:end]
+        print(f"pid: {os.getpid()}, rank: {args.global_rank},  have {len(layer_list)} layers ")
+        model_static_dict = {}
+        for idx, layer in enumerate(layer_list):
+            model_ckpt_path = module.ckpt_layer_path(ckpt_dir='/tmp',local_layer_idx=start + idx)
+            layer_i = int(model_ckpt_path.split('/')[-1].split('-')[0].replace('layer_', ''))
+            orig_state_dict = layer.state_dict()
+            final_state_dict = clone_tensors_for_torch_save(orig_state_dict)
+            print("已经处理layer：{}".format(layer_i))
+            if layer_i == 0:
+                model_static_dict["model.embed_tokens.weight"] = final_state_dict["embed_tokens.weight"]
+            elif layer_i <= 24 and layer_i >= 1:
+                for k, v in final_state_dict.items():
+                    model_static_dict["model." + k.replace("layer.", "layers.{}.".format(layer_i - 1), 1)] = v
+            elif layer_i == 25:  # norm layer
+                model_static_dict['model.norm.weight'] = final_state_dict['norm.weight']
+            elif layer_i == 26:
+                model_static_dict["lm_head.weight"] = final_state_dict["embed_tokens.weight"]
 
 
-    if args.output_dir is not None:
-        print_rank_0('saving the final model ...', args.global_rank)
-        engine.save_checkpoint(args.output_dir)
+        all_model_static_dict = gather_object(model_static_dict)
 
-    torch.distributed.barrier(device_ids=[args.global_rank])
-    print(f"finished saving model")
-
-    if args.global_rank == 0:
-        tokenizer.save_vocabulary(args.output_dir)
-        CONFIG_NAME = "config.json"
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-        model.config.to_json_file(output_config_file)
-        print(f"finished save vocabulary config and model config")
-    torch.distributed.barrier(device_ids=[args.global_rank])
-    print(f"done after sync, will exit programm ")
-
+        #each process has its own layer in model_static_dict
+        #need to collect them into process 0
+        if args.global_rank == 0:
+            for k, v in model_static_dict.items():
+                v = v.to(device)
+                vllm_client.update_named_param(k, v.data)
 
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()

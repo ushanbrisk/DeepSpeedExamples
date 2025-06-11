@@ -151,12 +151,14 @@ def get_pipeline_ds_config(args):
                      "enabled": args.enable_tensorboard,
                      "output_path": f"{args.tensorboard_path}/ds_tensorboard_logs/",
                      "job_name": f"step1_model_tensorboard"
-                 }
+                 },
+                 "wall_clock_breakdown": True,
+                 "dump_state": False
             }
     if args.custom_loss_fn:
         ds_config["gradient_checkpointing"] = True
 
-        ds_config["activation_checkpointing"]: {
+        ds_config["activation_checkpointing"] = {
             "partition_activations": True,
             "cpu_checkpointing": True,
             "contiguous_memory_optimization": True,

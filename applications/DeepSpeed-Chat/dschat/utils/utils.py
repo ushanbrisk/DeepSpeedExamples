@@ -250,6 +250,28 @@ def get_optimizer_grouped_parameters(
         },
     ]
 
+    not_any_names = [n
+    for n, p in model.named_parameters()
+        if (not any(nd in n.lower() for nd in no_decay_name_list)
+                and p.requires_grad and not any(nd in n.lower()
+                                                for nd in lora_name_list))
+    ]
+
+    name_lora = [
+                n for n, p in model.named_parameters()
+                if (not any(nd in n.lower() for nd in no_decay_name_list)
+                    and p.requires_grad and any(nd in n.lower()
+                                                for nd in lora_name_list))
+            ]
+
+    no_decay_name_list =  [
+                n for n, p in model.named_parameters()
+                if (any(nd in n.lower()
+                        for nd in no_decay_name_list) and p.requires_grad)
+            ]
+
+    print(f"pid: {os.getpid()}, not_any_names:{not_any_names}, name_lora:{name_lora}, no_decay_name_list:{no_decay_name_list}")
+
     non_empty_groups = []
     for group in optimizer_grouped_parameters:
         if group["params"]:

@@ -848,4 +848,138 @@ def create_prompt_dataset_0(
         return train_dataset, None
 
 
+def create_prompt_dataset_grpo(
+        is_eval,
+        local_rank,
+        data_path,
+        data_split,
+        data_output_path,
+        train_phase,
+        seed,
+        tokenizer,
+        max_seq_len,
+        end_of_conversation_token,
+        sft_only_data_path):
+    # if is_eval:
+    #     train_dataset, eval_dataset = create_prompt_dataset(
+    #         local_rank,
+    #         data_path,
+    #         data_split,
+    #         data_output_path,
+    #         train_phase,
+    #         seed,
+    #         tokenizer,
+    #         max_seq_len,
+    #         end_of_conversation_token=tokenizer.eos_token,
+    #         sft_only_data_path=sft_only_data_path)
+    #     return train_dataset, eval_dataset
+    # else:
+    train_dataset = create_prompt_dataset_2_grpo(
+        local_rank,
+        data_path,
+        data_split,
+        data_output_path,
+        train_phase,
+        seed,
+        tokenizer,
+        max_seq_len,
+        end_of_conversation_token=tokenizer.eos_token,
+        sft_only_data_path=sft_only_data_path)
+    return train_dataset, None
 
+def create_prompt_dataset_2_grpo(local_rank,
+                          data_path,
+                          data_split,
+                          output_path,
+                          train_phase,
+                          seed,
+                          tokenizer,
+                          max_seq_len,
+                          end_of_conversation_token="<|endoftext|>",
+                          sft_only_data_path=[],
+                          reload=False):
+    """
+    Creates the prompt dataset
+    """
+
+    ################
+    os.makedirs(output_path, exist_ok=True)
+    fname = "_".join(data_path)
+    #tokenizer_name = tokenizer.init_kwargs["name_or_path"].replace("/", "_")
+    #depends on tokenizer, as need tokenzier text
+    fname = f"grpo_raw_only_train_full_{fname}"
+    fname = "_".join(fname.split("/"))
+    fname = hashlib.sha256(fname.encode()).hexdigest(
+    )  # hash the file name to avoid too long file name
+    train_fname = f"{output_path}/traindata_{fname}.pt"
+
+    cache_found = os.path.isfile(train_fname)
+    buf_create_cache = torch.ByteTensor([not cache_found]).to(
+        get_accelerator().current_device_name())
+    torch.distributed.all_reduce(buf_create_cache)
+    ####
+
+    if local_rank <= 0 and (buf_create_cache.item() != 0 or reload):
+        print(f'Creating grpo dataset {data_path}, {reload=}')
+
+        if len(data_path) == 1:  # Single dataset.
+            train_dataset = create_dataset_grpo(
+                local_rank,
+                data_path[0],
+                data_split,
+                output_path,
+                train_phase,
+                seed,
+                tokenizer,
+                end_of_conversation_token,
+                max_seq_len,
+                rebuild=reload)
+        print(f'finish read dataset')
+        torch.save(train_dataset, train_fname)
+    torch.distributed.barrier()
+    return torch.load(train_fname, weights_only=False) # modifed 20250402 , weights_only=true
+
+
+def create_dataset_grpo(local_rank, dataset_name, data_split, output_path,
+                   train_phase, seed, tokenizer, end_of_conversation_token,
+                   max_seq_len, rebuild):
+    raw_dataset = get_raw_dataset(dataset_name, output_path, seed, local_rank)
+    print("finished get raw_data\n")
+    #train dataset
+    train_dataset = raw_dataset.get_train_data()
+#    train_dataset = train_dataset.select_columns(['messages'])
+    del raw_dataset
+
+    def make_conversation(example, prompt_column: str = 'problem'):
+        prompt = []
+        system_prompt = "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>"
+        prompt.append({"role": "system", "content": system_prompt})
+
+        if prompt_column not in example:
+            raise ValueError(f"Dataset Question Field Error: {prompt_column} is not supported.")
+
+        prompt.append({"role": "user", "content": example[prompt_column]})
+        return {"prompt": prompt}
+
+
+
+    map_kwargs = {}
+    map_kwargs["num_proc"] = 52 #here is the parallel process number
+    map_kwargs["desc"] = f"Applying making conversation template to {dataset_name} dataset"
+    train_dataset = train_dataset.map(make_conversation,**map_kwargs)
+
+    print("finish making conversation template() to all data\n")
+
+    # train_dataset = train_dataset.select_columns(['text'])
+    # map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
+    # map_kwargs["num_proc"] = 52
+    # train_dataset = train_dataset.map(lambda ex: tokenizer(ex["text"]), **map_kwargs)
+    # print("finish tokenizering all data\n")
+    #
+    # train_dataset = train_dataset.select_columns("input_ids")
+    # map_kwargs["desc"] = f"Packing {dataset_name} dataset"
+    # train_dataset = train_dataset.map(
+    #     pack_examples, batched=True, fn_kwargs={"seq_length": max_seq_len}, **map_kwargs
+    # )
+    # print("finish packing chosen_dataset\n")
+    return train_dataset
