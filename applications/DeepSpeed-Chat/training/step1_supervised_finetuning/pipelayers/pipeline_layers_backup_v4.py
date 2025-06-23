@@ -269,22 +269,26 @@ def loss_fn_parent(model, temperature=1.0,
         prompt_completion_ids,logits_to_keep, advantages = labels
         # labels = labels
 
+        # #start of test
+        # device_0 = advantages.device
+        # advantages = torch.tensor([0.34, -0.1, 0.2, -0.4, 0.9, 0.04, -0.5, -0.7]).to(device_0)
+        # #end of test
+
         original_seq_len = hidden_states.shape[1]
         valid_length = max((causal_mask == 1).sum(dim=-1))
 
+        #shrink
         hidden_states = hidden_states[:, :valid_length, :]
         causal_mask = causal_mask[:,:valid_length]
 
         prompt_completion_ids  = prompt_completion_ids[:,:valid_length]
         logits_to_keep = logits_to_keep - (original_seq_len - valid_length)
 
-
         logits_to_keep = int(logits_to_keep)
         slice_indices = slice(-(logits_to_keep+1), None) if isinstance(logits_to_keep, int) else logits_to_keep
-        hidden_states = hidden_states[:, slice_indices, :]
+        hidden_states = hidden_states[:, slice_indices, :] #1 more position
         slice_indices = slice(-(logits_to_keep), None) if isinstance(logits_to_keep, int) else logits_to_keep
         completion_mask = causal_mask[:, slice_indices]
-
 
         # hidden_states = hidden_states[...,:-1,:].contiguous()
         # input_ids = prompt_completion_ids[:, -logits_to_keep:].contiguous()
@@ -294,9 +298,7 @@ def loss_fn_parent(model, temperature=1.0,
         #
         # lce = LigerFusedLinearCrossEntropyLoss(reduction="mean")
 
-
         #logits = model(input_ids=hidden_states, attention_mask=causal_mask, logits_to_keep=logits_to_keep + 1).logits
-
 
         logits = F.linear(hidden_states, weight)
         logits = logits[:, :-1, :]
@@ -331,9 +333,10 @@ def loss_fn_parent(model, temperature=1.0,
 
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
-        del coef_1, coef_2, per_token_loss
+        del coef_1, coef_2, per_token_loss,per_token_loss1,per_token_loss2,per_token_logps
 
-        # print(f"pid: {os.getpid()},  loss_fn_parent() called, loss: {loss}")
+
+        print(f"pid: {os.getpid()},  loss_fn_parent() called, loss: {loss}, advantange: {advantages}")
         return loss
     return loss_fn
 

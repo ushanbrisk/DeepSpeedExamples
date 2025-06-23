@@ -89,13 +89,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=2,
+        default=4,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=2,
+        default=4,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -182,7 +182,7 @@ def parse_args():
     ## LoRA for efficient training setting
     parser.add_argument("--lora_dim",
                         type=int,
-                        default=16,
+                        default=0,
                         # default = 0,
                         help="If > 0, use LoRA for efficient training.")
     parser.add_argument("--lora_dropout",
@@ -224,6 +224,7 @@ def parse_args():
     ## Tensorboard logging
     parser.add_argument('--enable_tensorboard',
                         action='store_true',
+                        default=True,
                         help='Enable tensorboard logging')
     parser.add_argument('--tensorboard_path',
                         type=str,
@@ -241,11 +242,11 @@ def parse_args():
 
     parser.add_argument('--num_stages',
                         type = int,
-                        default=4,
+                        default=5,
                         help='pipeline stages.')
     parser.add_argument('--save_model_step',
                         type = int,
-                        default=200,
+                        default=20,
                         help='steps to save model checkpoint.')
     parser.add_argument('--flash_attention',
                         default="flash_attention_2",
@@ -422,9 +423,10 @@ def main():
 
     print_mem(args.global_rank, device)
     #clear cache of cuda
-    torch.cuda.empty_cache()
+    # torch.cuda.empty_cache()
 
     for step in range(args.num_train_epochs * num_update_steps_per_epoch-1):  #-1 is importtant , abandon last residual to avoid error
+        torch.cuda.empty_cache()
         start1 = time.time()
         print_rank_0(
             f"step {step}, progress: {(step*1.0)/(args.num_train_epochs * num_update_steps_per_epoch)}", args.global_rank)
@@ -444,10 +446,19 @@ def main():
                     pre_tag = f"global_step{engine.global_steps - args.save_model_step}"
                     existing_folder = os.path.join(args.output_dir, pre_tag)
                     if os.path.isdir(existing_folder):
+                        # #start of copy 1 file to check whether weight changes
+                        # if (step + 1) % 20 == 0:
+                        #     save_file = os.path.join(existing_folder,'layer_24-model_states.pt')
+                        #     new_index_tag = f"step_{step+1}"
+                        #     new_name = os.path.join(args.output_dir, new_index_tag)
+                        #     shutil.copy(save_file, new_name)
+                        # #end of copy 1 file to check whether weight changes
                         shutil.rmtree(existing_folder)
                         print(f"remove folder {existing_folder}")
             print(f"Saving at step {step}")
             engine.save_checkpoint(args.output_dir)
+
+
             if args.global_rank == 0 and engine.global_steps <= args.save_model_step:
                 tokenizer.save_vocabulary(args.output_dir)
                 CONFIG_NAME = "config.json"

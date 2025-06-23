@@ -35,12 +35,17 @@ from dschat.utils.module.lora import convert_linear_layer_to_lora, convert_lora_
 from dschat.utils.model.model_utils import create_hf_model, causal_lm_model_to_fp32_loss
 # from dschat.utils.perf import print_throughput
 # from pipelayers import PreEmbeddingPipeLayer, DecoderPipeLayer, NormPipeLayer, LMHeadPipeLayer, LossPipeLayer
-from pipelayers import get_model,get_model_loss_fn, DataCollatorForPromptDataset,DataCollatorForPromptDatasetDummy, print_mem, loss_fn_parent
+from pipelayers_grpo import get_model,get_model_loss_fn, DataCollatorForPromptDataset,DataCollatorForPromptDatasetDummy, print_mem, loss_fn_parent, loss_fn_parent_liger
 from grpo import get_reward_funcs, enable_gradient_checkpointing,check_module_requires_grad,PipelineGRPOEngine
 from peft import LoraConfig, PeftConfig, get_peft_model
 from accelerate.utils import is_peft_model
-from pipelayers import convert_model_to_hf, test_load_model
+from pipelayers_grpo import (convert_model_to_hf_qwen25_500m,
+                             test_load_model,
+                             convert_model_to_hf_qwen25_3b,
+                             convert_model_to_hf_qwen25_3b_no_bin,
+                             convert_model_to_hf_qwen25_500m_no_bin)
 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
+from pathlib import Path
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -87,7 +92,8 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="Qwen/Qwen2.5-0.5B-Instruct",
+        # default="Qwen/Qwen2.5-3B-Instruct",
+        default="lukedai/qwen2.5-3b-sft",
         help=
         "Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
@@ -114,7 +120,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-5,
+        default=1e-4,
         help=
         "Initial learning rate (after the potential warmup period) to use.",
     )
@@ -222,7 +228,7 @@ def parse_args():
     parser.add_argument(
         "--lora_learning_rate",
         type=float,
-        default=1e-5,
+        default=1e-4,
         help=
         "Initial LoRA learning rate (after the potential warmup period) to use."
     )
@@ -254,8 +260,8 @@ def parse_args():
                         default=4,
                         help='pipeline stages.')
     parser.add_argument('--save_model_step',
-                        default=10,
-                        help='steps to save model checkpoint.')
+                        default=1,
+                        help='steps to save model checkpoint. should be 1 only')
     parser.add_argument('--flash_attention',
                         default="flash_attention_2",
                         help='whether using flash attention.')
@@ -265,8 +271,6 @@ def parse_args():
     parser.add_argument('--custom_loss_fn',
                         default=True,
                         help='whether using loss_fn for last stage.')
-
-
 
     parser.add_argument('--reward_funcs',
                         default=['accuracy','format','tag_count'],
@@ -359,7 +363,10 @@ def main():
     # load_hf_tokenizer will get the correct tokenizer and set padding tokens based on the model family
     args.end_of_conversation_token = "<|endoftext|>"
     additional_special_tokens = args.end_of_conversation_token if args.add_eot_token else None
-    tokenizer = load_hf_tokenizer(args.model_name_or_path,
+
+    tokenizer_model_name = "Qwen/Qwen2.5-3B-Instruct" if args.model_name_or_path == "lukedai/qwen2.5-3b-sft" else args.model_name_or_path
+
+    tokenizer = load_hf_tokenizer(tokenizer_model_name,
                                   fast_tokenizer=True,
                                   add_special_tokens=additional_special_tokens)
 
@@ -374,6 +381,10 @@ def main():
     reward_funcs = get_reward_funcs(args)
     reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
 
+
+
+
+
     model = create_hf_model(AutoModelForCausalLM,
                             args.model_name_or_path,
                             tokenizer,
@@ -387,8 +398,9 @@ def main():
 
     if args.global_rank == 0:
         for name, param in model.named_parameters():
-            # print(f"name: {name}, param size: {param.data.shape}")
-            pass
+            print(f"name: {name}, param size: {param.data.shape}")
+            # pass
+        print(model)
 
     if args.compute_fp32_loss:
         print_rank_0(
@@ -506,7 +518,10 @@ def main():
 
     #data sampler
     # train_sampler = RandomSampler(train_dataset)
+    # there is possibility that batch_size_sampler<1,
+
     batch_size_sampler = args.per_device_train_batch_size * args.gradient_accumulation_steps // args.num_generations
+    assert batch_size_sampler > 0
 
     train_sampler = RepeatRandomSampler(data_source=train_dataset,
                                         mini_repeat_count=args.num_generations,
@@ -551,7 +566,14 @@ def main():
         model_pipe = PipelineModule(layers=get_model_loss_fn(model),
                                     num_stages=int(args.num_stages),
                                     # activation_checkpoint_interval = 4
-                                    loss_fn=loss_fn_parent(model,
+                                    loss_fn=loss_fn_parent_liger(model,
+                                                           temperature=args.temperature,
+                                                           num_iterations=args.num_iterations,
+                                                           gradient_accumulation_steps=args.gradient_accumulation_steps,
+                                                           epsilon_low=args.epsilon_low,
+                                                           epsilon_high=args.epsilon_high,
+                                                           ) if args.use_liger_kernel
+                                    else loss_fn_parent(model,
                                                            temperature=args.temperature,
                                                            num_iterations=args.num_iterations,
                                                            gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -630,6 +652,7 @@ def main():
 
     for step in range(args.num_train_epochs * num_update_steps_per_epoch-1):  #-1 is importtant , abandon last residual to avoid error
     # for step in range(1):
+        torch.cuda.empty_cache()
         #batch = next(train_dataloader)
         start1 = time.time()
 
@@ -651,16 +674,29 @@ def main():
         # print_mem(torch.distributed.get_rank(), device, f"after step {step} of training:")
         if (step + 1) % args.save_model_step == 0:
             if args.global_rank == 0:
+                #remove previous saving folder, only process 0
                 pre_tag = f"global_step{engine.global_steps - args.save_model_step}"
                 new_tag = f"global_step{engine.global_steps}"
                 existing_folder = os.path.join(args.output_dir, pre_tag)
                 new_folder = os.path.join(args.output_dir, new_tag)
                 if os.path.isdir(existing_folder):
+
+                    # #start of copy 1 file to check whether weight changes
+                    # if (step + 1) % 4 == 0:
+                    #     save_file = os.path.join(existing_folder,'layer_24-model_states.pt')
+                    #     new_index_tag = f"step_{step+1}"
+                    #     new_name = os.path.join(args.output_dir, new_index_tag)
+                    #     shutil.copy(save_file, new_name)
+                    # #end of copy 1 file to check whether weight changes
+
                     shutil.rmtree(existing_folder)
                     print(f"remove folder {existing_folder}")
+
+            #each process all saving weight
             print(f"Saving at step {step}")
             engine.save_checkpoint(args.output_dir)
 
+            #only for process 0 and at the begining of training
             if args.global_rank == 0 and engine.global_steps <= args.save_model_step:
                 tokenizer.save_vocabulary(args.output_dir)
                 CONFIG_NAME = "config.json"
@@ -669,8 +705,7 @@ def main():
 
             COLLECT_PARAMS = False
             if COLLECT_PARAMS:
-
-    #start of saving params directly ,replacing engine.save_checkpoint()
+                #start of saving params directly ,replacing engine.save_checkpoint()
                 if args.global_rank >= 0:
                     module = engine.module
                     num_layers = len(module.forward_funcs)
@@ -699,25 +734,44 @@ def main():
                         v = v.to(device)
                         vllm_client.update_named_param(k, v.data)
 
-    #the problem here:
+                #the problem here:
                 # 1. vllm server can only receive from one device
                 # mutiple stages params needs to first gather to one device,
                 # waste memory
                 #
                 # this version is not working
 
-
-            if args.global_rank == 0 and args.use_vllm:
-                convert_model_to_hf(new_folder, args.output_dir)
-                model, tokenizer = test_load_model(args.output_dir)
-                model = model.to(device)
+            #process 0 read from separate files and update to vllm server
+            WRITE_TO_DISK=True
+            # if args.global_rank == 0 and args.use_vllm and WRITE_TO_DISK:
+            #     #read state dict data of each layer from disk files, and save into bin
+            #     convert_model_to_hf_qwen25_500m(new_folder, args.output_dir)
+            #     model, tokenizer = test_load_model(args.output_dir)
+            #     model = model.to(device)
+            #     for name, param in model.named_parameters():
+            #         # print(f"name: {name}")
+            #         vllm_client.update_named_param(name, param.data)
+            #     # Reset cache on main process
+            #     vllm_client.reset_prefix_cache()
+            if args.global_rank == 0 and args.use_vllm and WRITE_TO_DISK:
+                #read state dict data of each layer from disk files, and save into bin
+                # convert_model_to_hf_qwen25_500m(new_folder, args.output_dir)
+                model_static_dict = convert_model_to_hf_qwen25_3b_no_bin(new_folder)
+                #
+                # test_result = model_static_dict.get('model.layers.0.self_attn.q_proj.weight')[0, :4]
+                # print(f"test result: {test_result}")
+                counttt = 0
                 for name, param in model.named_parameters():
                     # print(f"name: {name}")
-                    vllm_client.update_named_param(name, param.data)
+                    counttt += 1
+                    new_param = model_static_dict.get(name).to(device)
+                    # print(f"[upload] name: {name}, size: {param.shape}")
+                    vllm_client.update_named_param(name, new_param)
                 # Reset cache on main process
                 vllm_client.reset_prefix_cache()
-
-
+            elif args.global_rank == 0 and args.use_vllm and WRITE_TO_DISK==False:
+                # convert_model_to_hf(new_folder, args.output_dir)
+                pass
 
     # torch.cuda.empty_cache()
         # print_mem(args.global_rank, device, info=f"after step:{step} training")

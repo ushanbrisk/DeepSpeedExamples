@@ -8,7 +8,7 @@ import json
 from transformers import set_seed, AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
 
-def convert_model_to_hf(pipeline_model_dir, save_model_dir):
+def convert_model_to_hf_qwen25_500m(pipeline_model_dir, save_model_dir):
     model_static_dict = {}
     for path in Path(pipeline_model_dir).iterdir():
         print("已经处理文件：{}".format(path))
@@ -28,9 +28,34 @@ def convert_model_to_hf(pipeline_model_dir, save_model_dir):
                 model_static_dict["model." + k.replace("layer.", "layers.{}.".format(layer_i - 1), 1)] = v
     #
     torch.save(model_static_dict, join(save_model_dir, "pytorch_model.bin"))
-
 # do not consider lora layer
 #     model = convert_lora_to_linear_layer(model)
+
+def convert_model_to_hf_qwen25_3b(pipeline_model_dir, save_model_dir):
+    model_static_dict = {}
+    for path in Path(pipeline_model_dir).iterdir():
+        print("已经处理文件：{}".format(path))
+        if not path.name.startswith('layer'):
+            continue
+        small_static_dict = torch.load(path, map_location="cpu")
+        layer_i = int(path.name.split('-')[0].replace('layer_', ''))
+        if layer_i == 0:
+            model_static_dict["model.embed_tokens.weight"] = small_static_dict["embed_tokens.weight"]
+        elif layer_i == 38:
+            model_static_dict["lm_head.weight"] = small_static_dict["embed_tokens.weight"]
+        elif layer_i == 37: #norm layer
+            model_static_dict['model.norm.weight'] = small_static_dict['norm.weight']
+
+        elif layer_i <=36 and layer_i >= 1:
+            for k, v in small_static_dict.items():
+                model_static_dict["model." + k.replace("layer.", "layers.{}.".format(layer_i - 1), 1)] = v
+    #
+    torch.save(model_static_dict, join(save_model_dir, "pytorch_model.bin"))
+
+
+
+
+
 
 def get_tokenizer(model_name_or_path, fast_tokenizer=True):
     tokenizer = AutoTokenizer.from_pretrained(
@@ -72,7 +97,7 @@ def set_args():
 
 if __name__ == '__main__':
     ages = set_args()
-    convert_model_to_hf(ages.pipeline_model_dir, ages.save_model_dir)
+    convert_model_to_hf_qwen25_500m(ages.pipeline_model_dir, ages.save_model_dir)
 
     model, tokenizer = test_load_model(ages.save_model_dir)
     # model = model.to("cuda:1")
