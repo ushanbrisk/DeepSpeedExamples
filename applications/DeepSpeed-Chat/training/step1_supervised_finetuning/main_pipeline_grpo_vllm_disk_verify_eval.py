@@ -35,7 +35,7 @@ from dschat.utils.module.lora import convert_linear_layer_to_lora, convert_lora_
 from dschat.utils.model.model_utils import create_hf_model, causal_lm_model_to_fp32_loss
 # from dschat.utils.perf import print_throughput
 # from pipelayers import PreEmbeddingPipeLayer, DecoderPipeLayer, NormPipeLayer, LMHeadPipeLayer, LossPipeLayer
-from pipelayers_grpo import get_model,get_model_loss_fn, DataCollatorForPromptDataset,DataCollatorForPromptDatasetDummy, print_mem, loss_fn_parent, loss_fn_parent_liger
+from pipelayers_grpo import get_model,get_model_loss_fn, get_model_loss_fn_no_tied, DataCollatorForPromptDataset,DataCollatorForPromptDatasetDummy, print_mem, loss_fn_parent, loss_fn_parent_liger, loss_fn_parent_policy_gradient
 from grpo import get_reward_funcs, enable_gradient_checkpointing,check_module_requires_grad,PipelineGRPOEngine
 from peft import LoraConfig, PeftConfig, get_peft_model
 from accelerate.utils import is_peft_model
@@ -47,6 +47,12 @@ from pipelayers_grpo import (convert_model_to_hf_qwen25_500m,
                              TestSampler)
 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 from pathlib import Path
+from grpo import hash_tensor
+
+#this version add a eval_dataloader, which has the same processing with train_dataloader
+# and call engine.eval_batch(), the purpose is to verify model loss after optimizer.step() using
+# the exact same data, would really drop; and it did do that.
+# the Inference.Scheduler is in grpo_schedule.py, and override parent's method
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -55,8 +61,8 @@ def parse_args():
     parser.add_argument('--data_path',
                         nargs='*',
                         # default=['Dahoas/rm-static'],
-                        default = ['lukedai/test'],
-                        # default = ['open-r1/OpenR1-Math-220k'],
+                        # default = ['lukedai/test'],
+                        default = ['open-r1/OpenR1-Math-220k'],
                         help='Path to the training dataset. Accepted format:'
                         '1) a single data path, 2) multiple datasets in the'
                         'form: dataset1-path dataset2-path ...')
@@ -93,8 +99,10 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="Qwen/Qwen2.5-3B-Instruct",
+        # default="Qwen/Qwen2.5-3B-Instruct",
         # default="lukedai/qwen2.5-3b-sft",
+        default="Qwen/Qwen2.5-7B-Instruct",
+        # default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
         help=
         "Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
@@ -102,13 +110,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=4,
+        default=2,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=4,
+        default=2,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -121,7 +129,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-3,
+        default=1e-5,
         help=
         "Initial learning rate (after the potential warmup period) to use.",
     )
@@ -136,7 +144,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=4,
+        default=2,
         help=
         "Number of updates steps to accumulate before performing a backward/update pass.",
     )
@@ -229,7 +237,7 @@ def parse_args():
     parser.add_argument(
         "--lora_learning_rate",
         type=float,
-        default=1e-3,
+        default=1e-5,
         help=
         "Initial LoRA learning rate (after the potential warmup period) to use."
     )
@@ -258,7 +266,7 @@ def parse_args():
                         help='Prints loss at each step.')
 
     parser.add_argument('--num_stages',
-                        default=4,
+                        default=5,
                         help='pipeline stages.')
     parser.add_argument('--save_model_step',
                         default=1,
@@ -274,17 +282,17 @@ def parse_args():
                         help='whether using loss_fn for last stage.')
 
     parser.add_argument('--reward_funcs',
-                        # default=['accuracy','format','tag_count'],
-                        default=['accuracy'],
+                        default=['accuracy','format','tag_count'],
+                        # default=['accuracy'],
                         help='reward functions for reinforcement learning.')
 
     parser.add_argument('--reward_weights',
-                        # default=[1.0, 1.0, 1.0],
-                        default=[1.0],
+                        default=[1.0, 1.0, 1.0],
+                        # default=[1.0],
                         help='reward functions weights for reinforcement learning.')
 
     parser.add_argument('--num_generations',
-                        default=4,
+                        default=2,
                         help='grpo G, number of generations for each prompt')
 
     parser.add_argument('--max_prompt_length',
@@ -539,8 +547,6 @@ def main():
                                         repeat_count=args.num_iterations,  #
                                         seed=123)  #here need to consider seed?
 
-
-
 # ######################### old data collator for sft   ##
 #     #data collator
 #     # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
@@ -575,17 +581,17 @@ def main():
     # print(model)
     #loss = loss_fn(outputs, label)
     if args.custom_loss_fn:
-        model_pipe = PipelineModule(layers=get_model_loss_fn(model),
+        model_pipe = PipelineModule(layers=get_model_loss_fn_no_tied(model),
                                     num_stages=int(args.num_stages),
                                     # activation_checkpoint_interval = 4
-                                    loss_fn=loss_fn_parent(model,
+                                    loss_fn=loss_fn_parent_liger(model,
                                                            temperature=args.temperature,
                                                            num_iterations=args.num_iterations,
                                                            gradient_accumulation_steps=args.gradient_accumulation_steps,
                                                            epsilon_low=args.epsilon_low,
                                                            epsilon_high=args.epsilon_high,
                                                            ) if args.use_liger_kernel
-                                    else loss_fn_parent_liger(model,
+                                    else loss_fn_parent(model,
                                                            temperature=args.temperature,
                                                            num_iterations=args.num_iterations,
                                                            gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -651,7 +657,6 @@ def main():
                                            pipeline_grpo_config=pipeline_grpo_config
                                            )
 
-
     train_dataloader = iter(deepspeed.utils.RepeatingLoader(train_dataloader))
     # train_dataloader = iter(train_dataloader)
     # Train!
@@ -663,7 +668,7 @@ def main():
     torch.cuda.empty_cache()
 
     for step in range(args.num_train_epochs * num_update_steps_per_epoch-1):  #-1 is importtant , abandon last residual to avoid error
-    # for step in range(1):
+    # for step in range(10):
         torch.cuda.empty_cache()
         #batch = next(train_dataloader)
         start1 = time.time()
@@ -676,11 +681,16 @@ def main():
         loss = engine.train_batch(data_iter = train_dataloader,
                                   tokenizer=tokenizer)
 
+        loss_eval = engine.eval_batch()
+        # loss_eval = -1
+
+        # return
+
         end1 = time.time()
         # torch.cuda.empty_cache()   #clear cache, for test sd
-        if args.print_loss:
+        if args.print_loss and args.global_rank == args.num_stages-1:
             print(
-                f"step: {step}, Rank: {torch.distributed.get_rank()}, loss = {loss}, time comsumed = {end1-start1}"
+                f"step: {step}, Rank: {torch.distributed.get_rank()}, loss:{loss}, loss_eval:{loss_eval}, time comsumed = {end1-start1}"
             )
 #check mem
         # print_mem(torch.distributed.get_rank(), device, f"after step {step} of training:")
@@ -715,43 +725,43 @@ def main():
                 output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
                 model.config.to_json_file(output_config_file)
 
-            COLLECT_PARAMS = False
-            if COLLECT_PARAMS:
-                #start of saving params directly ,replacing engine.save_checkpoint()
-                if args.global_rank >= 0:
-                    module = engine.module
-                    num_layers = len(module.forward_funcs)
-                    start, end = 0, num_layers
-                    layer_list = module.forward_funcs[start:end]
-                    model_static_dict = {}
-                    for idx, layer in enumerate(layer_list):
-                        model_ckpt_path = module.ckpt_layer_path(ckpt_dir='/tmp',local_layer_idx=start + idx)
-                        layer_i = int(model_ckpt_path.split('/')[-1].split('-')[0].replace('layer_', ''))
-                        orig_state_dict = layer.state_dict()
-                        final_state_dict = clone_tensors_for_torch_save(orig_state_dict)
-                        print("已经处理layer：{}".format(layer_i))
-                        if layer_i == 0:
-                            model_static_dict["model.embed_tokens.weight"] = final_state_dict["embed_tokens.weight"]
-                        elif layer_i <= 24 and layer_i >= 1:
-                            for k, v in final_state_dict.items():
-                                model_static_dict["model." + k.replace("layer.", "layers.{}.".format(layer_i - 1), 1)] = v
-                        elif layer_i == 25:  # norm layer
-                            model_static_dict['model.norm.weight'] = final_state_dict['norm.weight']
-                        elif layer_i == 26:
-                            model_static_dict["lm_head.weight"] = final_state_dict["embed_tokens.weight"]
-                    #each process has its own layer in model_static_dict
-                    #need to collect them into process 0
-                if args.global_rank == 0 and args.use_vllm:
-                    for k, v in model_static_dict.items():
-                        v = v.to(device)
-                        vllm_client.update_named_param(k, v.data)
-
-                #the problem here:
-                # 1. vllm server can only receive from one device
-                # mutiple stages params needs to first gather to one device,
-                # waste memory
-                #
-                # this version is not working
+            # COLLECT_PARAMS = False
+            # if COLLECT_PARAMS:
+            #     #start of saving params directly ,replacing engine.save_checkpoint()
+            #     if args.global_rank >= 0:
+            #         module = engine.module
+            #         num_layers = len(module.forward_funcs)
+            #         start, end = 0, num_layers
+            #         layer_list = module.forward_funcs[start:end]
+            #         model_static_dict = {}
+            #         for idx, layer in enumerate(layer_list):
+            #             model_ckpt_path = module.ckpt_layer_path(ckpt_dir='/tmp',local_layer_idx=start + idx)
+            #             layer_i = int(model_ckpt_path.split('/')[-1].split('-')[0].replace('layer_', ''))
+            #             orig_state_dict = layer.state_dict()
+            #             final_state_dict = clone_tensors_for_torch_save(orig_state_dict)
+            #             print("已经处理layer：{}".format(layer_i))
+            #             if layer_i == 0:
+            #                 model_static_dict["model.embed_tokens.weight"] = final_state_dict["embed_tokens.weight"]
+            #             elif layer_i <= 24 and layer_i >= 1:
+            #                 for k, v in final_state_dict.items():
+            #                     model_static_dict["model." + k.replace("layer.", "layers.{}.".format(layer_i - 1), 1)] = v
+            #             elif layer_i == 25:  # norm layer
+            #                 model_static_dict['model.norm.weight'] = final_state_dict['norm.weight']
+            #             elif layer_i == 26:
+            #                 model_static_dict["lm_head.weight"] = final_state_dict["embed_tokens.weight"]
+            #         #each process has its own layer in model_static_dict
+            #         #need to collect them into process 0
+            #     if args.global_rank == 0 and args.use_vllm:
+            #         for k, v in model_static_dict.items():
+            #             v = v.to(device)
+            #             vllm_client.update_named_param(k, v.data)
+            #
+            #     #the problem here:
+            #     # 1. vllm server can only receive from one device
+            #     # mutiple stages params needs to first gather to one device,
+            #     # waste memory
+            #     #
+            #     # this version is not working
 
             #process 0 read from separate files and update to vllm server
             WRITE_TO_DISK=True
@@ -772,6 +782,30 @@ def main():
                 #
                 # test_result = model_static_dict.get('model.layers.0.self_attn.q_proj.weight')[0, :4]
                 # print(f"test result: {test_result}")
+
+                #start of verify params integrity with train_batch() loop
+                layers_funcs = engine.module.forward_funcs
+                partitions = engine.module.parts
+                final_count = -1
+                for iter_part in partitions[1:-1]:
+                    final_count+=1
+                    layer_idx = iter_part - 2
+                    named_param = list(model.model.layers[layer_idx].named_parameters())[0]
+                    # weight_hash = hash_tensor(named_param[1].data)
+                    # weight_test_sample = (named_param[1].data[0][:10])
+                    full_name = f"model.layers.{layer_idx}.{named_param[0]}"
+                    test_param = model_static_dict.get(full_name)
+                    if test_param is not None and test_param.data is not None:
+                        weight_hash = hash_tensor(test_param.data)
+                        weight_test_sample = (test_param.data[0][:10])
+                    else:
+                        weight_hash = None
+                        weight_test_sample = None
+                    print(
+                        f"stage:{final_count}, step:{step}, name:{full_name}, layer hash:{weight_hash}, weight_test_sample:{weight_test_sample}")
+                # #end of verify
+
+
                 counttt = 0
                 for name, param in model.named_parameters():
                     # print(f"name: {name}")

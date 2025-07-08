@@ -75,6 +75,29 @@ def convert_model_to_hf_qwen25_3b_no_bin(pipeline_model_dir):
     #
     return  model_static_dict
 
+#only read separate weight files for each layer, return dict, no saving to disk
+def convert_model_to_hf_qwen25_7b_no_bin(pipeline_model_dir):
+    model_static_dict = {}
+    for path in Path(pipeline_model_dir).iterdir():
+        print("已经处理文件：{}".format(path))
+        if not path.name.startswith('layer'):
+            continue
+        small_static_dict = torch.load(path, map_location="cpu")
+        layer_i = int(path.name.split('-')[0].replace('layer_', ''))
+        if layer_i == 0:
+            model_static_dict["model.embed_tokens.weight"] = small_static_dict["embed_tokens.weight"]
+        elif layer_i == 30:
+            model_static_dict["lm_head.weight"] = small_static_dict["embed_tokens.weight"]
+        elif layer_i == 29: #norm layer
+            model_static_dict['model.norm.weight'] = small_static_dict['norm.weight']
+
+        elif layer_i <=28 and layer_i >= 1:
+            for k, v in small_static_dict.items():
+                model_static_dict["model." + k.replace("layer.", "layers.{}.".format(layer_i - 1), 1)] = v
+    #
+    return  model_static_dict
+
+
 def convert_model_to_hf_qwen25_500m_no_bin(pipeline_model_dir):
     model_static_dict = {}
     for path in Path(pipeline_model_dir).iterdir():

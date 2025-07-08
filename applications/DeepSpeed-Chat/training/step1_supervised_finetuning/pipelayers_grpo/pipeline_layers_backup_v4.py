@@ -5,8 +5,7 @@ import torch
 from accelerate.utils import is_peft_model
 from deepspeed.runtime.pipe import TiedLayerSpec, LayerSpec
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-
-
+from grpo import hash_tensor
 
 
 from training.step1_supervised_finetuning.grpo import get_reward_funcs, enable_gradient_checkpointing,check_module_requires_grad,PipelineGRPOEngine
@@ -69,7 +68,7 @@ class PreEmbeddingPipeLayer(torch.nn.Module):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         cos, sin = position_embeddings
         requires_grad_idx = torch.tensor([3]).to(hidden_states.device)  #here 3 different from [3], 3 may cause error in communication
-        # print(f"pid: {os.getpid()},  PreEmbedding forward() called")
+        # print(f"pid: {os.getpid()},  PreEmbedding forward() called, hidden_states")
         # return requires_grad_idx, cos, sin, hidden_states, causal_mask, torch.tensor([logits_to_keep]).to(hidden_states.device), prompt_completion_ids
         return hidden_states, causal_mask
 
@@ -91,7 +90,7 @@ class DecoderPipeLayer(torch.nn.Module):
 
 
     def forward(self, ipt):
-        # print(f"decoder layer: {self.layer_idx} been called")
+
         hidden_states, causal_mask = ipt
 
         #reconstruct rotary embedding
@@ -122,6 +121,7 @@ class DecoderPipeLayer(torch.nn.Module):
 
         hidden_states = layer_outputs[0]
         # print(f"pid: {os.getpid()},  DecoderLayer.{self.layer_idx} forward() called")
+        # print(f"decoder layer: {self.layer_idx} been called, output: hidden_states:{hash_tensor(hidden_states)}")
         return hidden_states, causal_mask
 
 class NormPipeLayer(torch.nn.Module):
@@ -196,6 +196,16 @@ def get_model_loss_fn(model):
               ]
     return layers
 
+def get_model_loss_fn_no_tied(model):
+    layers = [LayerSpec(PreEmbeddingPipeLayer, model=model),
+              *[LayerSpec(DecoderPipeLayer, model=model, layer_idx=idx) for idx in
+                range(model.config.num_hidden_layers)],
+              LayerSpec(NormPipeLayer, model=model),
+              LayerSpec(LMHeadLossPipeLayerDummy, model=model),
+              ]
+    return layers
+
+
 
 def get_model(model):
     layers = [TiedLayerSpec(key="embed",typename = PreEmbeddingPipeLayer, model=model),
@@ -267,8 +277,107 @@ class LMHeadLossPipeLayer(torch.nn.Module):
         return loss
 
 
-
 def loss_fn_parent(model, temperature=1.0,
+                   num_iterations=1,
+                   gradient_accumulation_steps=1,
+                   epsilon_low = 0.0,
+                   epsilon_high = 0.0):
+    if is_peft_model(model):
+        embed_tokens = model.base_model.model.model.embed_tokens
+    else:
+        embed_tokens = model.model.embed_tokens
+    weight = embed_tokens.weight
+    #here weight is tied with input embedding matrix, now is lm_head
+
+    def loss_fn(outputs, labels, old_token_logps, global_pipeline_steps, step):
+        # print(f"loss_fn memory: id{id(embed_tokens.weight)}, pid:{os.getpid()}")
+        hidden_states, causal_mask = outputs
+        prompt_completion_ids,logits_to_keep, advantages = labels
+        # labels = labels
+
+        # #start of test
+        # device_0 = advantages.device
+        # advantages = torch.tensor([0.34, -0.1, 0.2, -0.4, 0.9, 0.04, -0.5, -0.7]).to(device_0)
+        # #end of test
+
+        original_seq_len = hidden_states.shape[1]
+        valid_length = max((causal_mask == 1).sum(dim=-1))
+
+        print(f"valid_length:{valid_length}, hidden_states_shape:{hidden_states.shape}, causal_mask_shape:{causal_mask.shape}")
+        print(f"loss_fn1 input hidden_states:{hash_tensor(hidden_states)}, causal_mask:{hash_tensor(causal_mask)}")
+
+        #shrink
+        hidden_states = hidden_states[:, :valid_length, :]
+        causal_mask = causal_mask[:,:valid_length]
+
+        prompt_completion_ids  = prompt_completion_ids[:,:valid_length]
+        logits_to_keep = logits_to_keep - (original_seq_len - valid_length)
+
+        logits_to_keep = int(logits_to_keep)
+        slice_indices = slice(-(logits_to_keep+1), None) if isinstance(logits_to_keep, int) else logits_to_keep
+        hidden_states = hidden_states[:, slice_indices, :] #1 more position
+        slice_indices = slice(-(logits_to_keep), None) if isinstance(logits_to_keep, int) else logits_to_keep
+        completion_mask = causal_mask[:, slice_indices]
+
+        # hidden_states = hidden_states[...,:-1,:].contiguous()
+        # input_ids = prompt_completion_ids[:, -logits_to_keep:].contiguous()
+        #
+        # hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        # input_ids = input_ids.view(-1)
+        #
+        # lce = LigerFusedLinearCrossEntropyLoss(reduction="mean")
+
+        #logits = model(input_ids=hidden_states, attention_mask=causal_mask, logits_to_keep=logits_to_keep + 1).logits
+
+        logits = F.linear(hidden_states, weight)
+        logits = logits[:, :-1, :]
+
+        input_ids = prompt_completion_ids[:, -logits_to_keep:]
+
+        print(f"pid: {os.getpid()}, loss_fn2, data hash()_b prompt:{hash_tensor(prompt_completion_ids)}, hidden:{hash_tensor(hidden_states)}")
+
+
+        logits = logits[:, -logits_to_keep:]
+
+        logits = logits / temperature
+
+        per_token_logps =  selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
+
+        if num_iterations > 1:
+            if global_pipeline_steps == 0:  #first round in num_iterations rounds
+                #use the same, but with grad detached()
+                old_per_token_logps  = per_token_logps.detach()
+                old_token_logps[step % gradient_accumulation_steps] = old_per_token_logps.clone().detach()  #write back old value to store
+
+            else:  #read old data from buffer
+                old_per_token_logps = old_token_logps[step%gradient_accumulation_steps].clone().detach()
+
+            ### wait for complete
+        elif num_iterations == 1: #no need share memory for recycle data usage
+            old_per_token_logps  = per_token_logps.detach()
+
+        coef_1 = torch.exp(per_token_logps - old_per_token_logps)
+        coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
+        #for test :
+        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+
+        # del coef_1, coef_2, per_token_loss,per_token_loss1,per_token_loss2,per_token_logps
+
+
+        # print(f"pid: {os.getpid()},  loss_fn_parent() called, loss: {loss}, advantange: {advantages}")
+
+        print(
+            f"loss_fn3,hidden_states:{hash_tensor(hidden_states)},weight:{hash_tensor(weight)}, input_ids:{hash_tensor(input_ids)},completion_mask:{hash_tensor(completion_mask)},advtg:{hash_tensor(advantages)}, advtg:{advantages}, per_token_loss1:{per_token_loss1}, per_token_loss1:{per_token_loss2}, loss:{loss}")
+
+        return loss
+    return loss_fn
+
+
+def loss_fn_parent_policy_gradient(model, temperature=1.0,
                    num_iterations=1,
                    gradient_accumulation_steps=1,
                    epsilon_low = 0.0,
@@ -328,32 +437,13 @@ def loss_fn_parent(model, temperature=1.0,
 
         per_token_logps =  selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
 
-        if num_iterations > 1:
-            if global_pipeline_steps == 0:  #first round in num_iterations rounds
-                #use the same, but with grad detached()
-                old_per_token_logps  = per_token_logps.detach()
-                old_token_logps[step % gradient_accumulation_steps] = old_per_token_logps.clone().detach()  #write back old value to store
+        per_token_loss1 = per_token_logps * advantages.unsqueeze(1)
 
-            else:  #read old data from buffer
-                old_per_token_logps = old_token_logps[step%gradient_accumulation_steps].clone().detach()
-
-            ### wait for complete
-        elif num_iterations == 1: #no need share memory for recycle data usage
-            old_per_token_logps  = per_token_logps.detach()
-
-        coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-        coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
-        #for test :
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        per_token_loss = -per_token_loss1
 
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
-        del coef_1, coef_2, per_token_loss,per_token_loss1,per_token_loss2,per_token_logps
-
-
-        print(f"pid: {os.getpid()},  loss_fn_parent() called, loss: {loss}, advantange: {advantages}")
+        print(f"pid: {os.getpid()},  loss_fn_parent_policy_gradient() called, loss: {loss}, advantange: {advantages}")
         return loss
     return loss_fn
 
@@ -376,17 +466,14 @@ def loss_fn_parent_liger(model, temperature=1.0,
         use_ref_model=False,
     )
 
-
-
-
-
     def loss_fn(outputs, labels, old_token_logps, global_pipeline_steps, step):
         # print(f"loss_fn memory: id{id(embed_tokens.weight)}, pid:{os.getpid()}")
         hidden_states, causal_mask = outputs
         prompt_completion_ids,logits_to_keep, advantages = labels
         # labels = labels
+        # if advantages.any(dim=-1) == True:
 
-        # #start of test
+ # #start of test
         # device_0 = advantages.device
         # advantages = torch.tensor([0.34, -0.1, 0.2, -0.4, 0.9, 0.04, -0.5, -0.7]).to(device_0)
         # #end of test
@@ -394,9 +481,14 @@ def loss_fn_parent_liger(model, temperature=1.0,
         original_seq_len = hidden_states.shape[1]
         valid_length = max((causal_mask == 1).sum(dim=-1))
 
+        print(f"valid_length:{valid_length}, hidden_states_shape:{hidden_states.shape}, causal_mask_shape:{causal_mask.shape}")
+        print(f"loss_fn1 input hidden_states:{hash_tensor(hidden_states)}, causal_mask:{hash_tensor(causal_mask)}")
         #shrink
         hidden_states = hidden_states[:, :valid_length, :]
         causal_mask = causal_mask[:,:valid_length]
+
+        hash_0 = hash_tensor(prompt_completion_ids)
+        shape_0 = prompt_completion_ids.shape
 
         prompt_completion_ids  = prompt_completion_ids[:,:valid_length]
         logits_to_keep = logits_to_keep - (original_seq_len - valid_length)
@@ -422,6 +514,10 @@ def loss_fn_parent_liger(model, temperature=1.0,
 
         #logits = model(input_ids=hidden_states, attention_mask=causal_mask, logits_to_keep=logits_to_keep + 1).logits
 
+        #this print is for debugging evaluation data the same with train
+        print(f"pid: {os.getpid()}, loss_fn2, data hash()_b prompt:{hash_tensor(prompt_completion_ids)}, hidden:{hash_tensor(hidden_states)}")
+
+
         #1.hidden_states  B, L, H
         #2.weight  H, VOCAB_DIM
 
@@ -434,14 +530,13 @@ def loss_fn_parent_liger(model, temperature=1.0,
             # ref_per_token_logps=inputs["ref_per_token_logps"],
             # old_per_token_logps=inputs["old_per_token_logps"],
         )
+        clip_ratio = metrics[-1]
 
-
-
-
-
+        print(
+            f"loss_fn3,hidden_states:{hash_tensor(hidden_states)},weight:{hash_tensor(weight)}, input_ids:{hash_tensor(input_ids)},completion_mask:{hash_tensor(completion_mask)},advtg:{hash_tensor(advantages)}, loss:{loss}")
 #end of liger
 
-        print(f"pid: {os.getpid()},  loss_fn_parent() called, loss: {loss}, advantange: {advantages}")
+        # print(f"pid: {os.getpid()},  loss_fn_parent() called, loss: {loss}, advantange: {advantages}")
         return loss
     return loss_fn
 

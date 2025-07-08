@@ -1,6 +1,7 @@
 from .reward import  *
 from .grpo_trainer import  *
 from .PipelineGRPOEngine import *
+from .reward import *
 __all__ = ['accuracy_reward',
            'format_reward',
            'tag_count_reward',
@@ -15,5 +16,6 @@ __all__ = ['accuracy_reward',
            'get_reward_funcs',
            'enable_gradient_checkpointing',
            'check_module_requires_grad',
-           'PipelineGRPOEngine'
+           'PipelineGRPOEngine',
+           'hash_tensor'
            ]

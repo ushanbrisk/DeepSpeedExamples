@@ -1,3 +1,4 @@
+import copy
 import time
 
 from deepspeed.runtime.pipe.engine import PipelineEngine
@@ -9,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 from collections.abc import Mapping
 from torch import nn
 import warnings
+import os
+from types import MethodType
 from functools import reduce
 from operator import mul
 from deepspeed.runtime.pipe import schedule, p2p
@@ -20,7 +23,9 @@ from deepspeed import comm as dist
 from deepspeed.runtime.utils import PartitionedTensor
 from deepspeed.runtime.activation_checkpointing import checkpointing as ds_checkpointing
 from collections import OrderedDict
+
 from . import grpo_schedule
+from .grpo_schedule import InferenceSchedule
 from . hash import hash_tensor
 from . pipeline_data_loader import BatchDataBuffer
 
@@ -28,6 +33,7 @@ MEMORY_OPT_ALLREDUCE_SIZE = 500000000
 
 BATCH_INPUT_TIMER = 'batch_input'
 TRAIN_BATCH_TIMER = 'train_batch'
+EVAL_BATCH_TIMER = 'eval_batch'
 PIPE_SEND_OUTPUT_TIMER = 'pipe_send_output'
 PIPE_SEND_GRAD_TIMER = 'pipe_send_grad'
 PIPE_RECV_INPUT_TIMER = 'pipe_recv_input'
@@ -62,7 +68,7 @@ class PipelineGRPOEngine(PipelineEngine):
         self.reward_funcs = pipeline_grpo_config['reward_funcs']
         self.reward_weights = pipeline_grpo_config['reward_weights']
         self.reward_processing_classes = [None] * len(self.reward_funcs)
-
+        self.extended_buf_label = 0  #only useful for Inference mode, when need more buffer for 'label' to store reward data
         #since we use buffer for a total of gas steps, no need below function any more
 
         #self.set_batch_fn(self.prepare_inputs)  #should comment this func, when using buffer
@@ -75,6 +81,9 @@ class PipelineGRPOEngine(PipelineEngine):
         #for storing prompt_id, completiton_id, advantage
         #it will be prepared before entering pipeline
         self._buffered_inputs = [None] * self.micro_batches  #get from super class, equal gas
+
+    #for evaluation purpose debug purpose
+        self._eval_data_buffer = [None]
 
         #for storing ref_token_logps, will be saved after loss_fn()
         #should contains gas elements
@@ -113,18 +122,19 @@ class PipelineGRPOEngine(PipelineEngine):
             prompt_ids = prompt_ids[:, -self.max_prompt_length:]
             prompt_mask = prompt_mask[:, -self.max_prompt_length:]
 
-        if True:
-            # # First, have main process load weights if needed
-            # if self.global_pipeline_step != self._last_loaded_step:
-            #     self._move_model_to_vllm()  # after update param every gas steps, need to upload to server
-            #     self._last_loaded_step = self.global_pipeline_step
 
-            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+        # # First, have main process load weights if needed
+        # if self.global_pipeline_step != self._last_loaded_step:
+        #     self._move_model_to_vllm()  # after update param every gas steps, need to upload to server
+        #     self._last_loaded_step = self.global_pipeline_step
 
-            # here not using ddp, so need to consider how the data format?
-            # all_prompts_text = gather_object(prompts_text)
-            all_prompts_text = prompts_text
+        # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
 
+        # here not using ddp, so need to consider how the data format?
+        # all_prompts_text = gather_object(prompts_text)
+        all_prompts_text = prompts_text
+
+        while True:
             # if self.accelerator.is_main_process:
             if self.global_rank == 0:
                 ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
@@ -144,17 +154,26 @@ class PipelineGRPOEngine(PipelineEngine):
             else:  # other rank won't execute this function
                 completion_ids = [None] * len(all_prompts_text)
 
+            #print is to show the length of answer, to see whether it reach maximum limit
+            print(f"answer shape:{[len(ele) for ele in completion_ids]}")
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
 
-        #batch is of batch_size rows
-        # if wait..:
-        mean_rwd, std_rwd, advtg , rewards_per_func= self.compute_text_rewards(
-            inputs = inputs,
-            prompts = prompts,
-            completion_ids = completion_ids,
-            bool_is_conv = bool_is_conv)
+            #batch is of batch_size rows
+            # if wait..:
+            mean_rwd, std_rwd, advtg , rewards_per_func= self.compute_text_rewards(
+                inputs = inputs,
+                prompts = prompts,
+                completion_ids = completion_ids,
+                bool_is_conv = bool_is_conv)
+
+            #here is to trick to jump out of reject sampling
+            if advtg.sum() != 0.0 or advtg.sum() == 0.0:
+            # if advtg.sum() != 0.0:
+                break
+
+
 
         #get completion mask
         # Mask everything after the first EOS token
@@ -170,6 +189,9 @@ class PipelineGRPOEngine(PipelineEngine):
 
         logits_to_keep = completion_ids.size(1)
         send_to_last_stage = (prompt_completion_ids, torch.tensor([logits_to_keep]), advtg)
+
+        #this print is for debugging evaluation info the same with train
+        # print(f"prepare_pipeline_total_inputs(), advtg:{advtg}, capsulate data hash():{hash_tensor( prompt_completion_ids)}, shape:{prompt_completion_ids.shape}")
 
         return (send_to_next_stage, send_to_last_stage)
 
@@ -219,6 +241,10 @@ class PipelineGRPOEngine(PipelineEngine):
                 output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32)
 
+        # if rewards_per_func.any(dim=-1)==True:
+        if rewards_per_func.sum() != 0.0:
+            print(f"reward_per_func: {rewards_per_func}")
+
         if torch.isnan(rewards_per_func).all(dim=1).any():
             nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
             row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
@@ -232,6 +258,14 @@ class PipelineGRPOEngine(PipelineEngine):
                 f"All reward functions returned None for the following kwargs: {row_reward_kwargs}. "
                 "Please ensure that at least one reward function returns a valid reward."
             )
+
+#start of logging
+        total_log = f"prompt:{prompts[0][1]['content']}\n\n\n\n"
+        for i_ans in range(len(prompts)):
+            one_ans = f"    idx:[{i_ans}]-------------------\n        completion: {completions[i_ans][0]['content']}\n        reward:{rewards_per_func[i_ans]}\n\n"
+            total_log = total_log + one_ans
+        print(total_log)
+#end of logging
 
         rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
 
@@ -291,6 +325,9 @@ class PipelineGRPOEngine(PipelineEngine):
             # First, have main process load weights if needed
             if self.global_pipeline_step != self._last_loaded_step:
                 self._move_model_to_vllm()  #after update param every gas steps, need to upload to server
+                #move upper function to last part of for loop outside in the main function
+                #and use update param to vllm server
+                #it will first read param from local disk files, merges them and upload
                 self._last_loaded_step = self.global_pipeline_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
@@ -570,6 +607,7 @@ class PipelineGRPOEngine(PipelineEngine):
 
 
     def _exec_load_micro_batch(self, buffer_id):
+        # print(f"_exec_load_micro_batch() called")
         if self.wall_clock_breakdown():
             self.timers(BATCH_INPUT_TIMER).start()
         if self.is_first_stage():
@@ -670,7 +708,10 @@ class PipelineGRPOEngine(PipelineEngine):
             self.pipe_buffers['inputs'][buffer_id] = inputs
 
         # inputs has no gradient because it is from a cloned tensor
+
         outputs = super(PipelineEngine,self).forward(inputs)
+        print(f"step:{self.global_steps},stage:{self.stage_id}, buffer_id:{buffer_id}, inputs:{hash_tensor(inputs)}, outputs:{hash_tensor(outputs)}")
+
 
         # Reset activation checkpointing buffers.
         # Need to call this between evaluation iterations
@@ -713,6 +754,13 @@ class PipelineGRPOEngine(PipelineEngine):
         if self.is_last_stage():
             if self._compute_loss and self.module.loss_fn is not None:
                 labels = self.pipe_buffers['labels'][buffer_id]
+
+
+                #start of debug print, to verify evaluation data the same with train
+                # prompt_completion_ids, logits_to_keep, advantages = labels
+                # print(f"pid: {os.getpid()}, buffer_id:{buffer_id}, exec_forward_pass() get label data, adv:{advantages},data trim hash() : {hash_tensor(prompt_completion_ids)}, data trim shape:{prompt_completion_ids.shape}")
+                #end of debug print
+
                 self.loss = self.module.loss_fn(outputs,
                                                 labels,
                                                 self._old_token_logps,
@@ -1247,6 +1295,12 @@ class PipelineGRPOEngine(PipelineEngine):
         #outputs should contains all the  information needed to
         #transmit from stage0 to last stage
 
+        # #start of print info, to verify label data integrity, in evaluation and train mode
+        # prompt_completion_ids, logits_to_keep, advtg = outputs
+        # print(
+        #     f"pid: {os.getpid()}, buffer_id:{buffer_id},send_rewards(),send adv:{advtg}, data hash() : {hash_tensor(prompt_completion_ids)}, shape:{prompt_completion_ids.shape}")
+        # #end of print info
+
         # NCCL does not like to send torch.BoolTensor types, so cast the mask to half().
         # We could do char, but with half() we can eventually flatten with other fp16
         # messages (TODO)
@@ -1329,6 +1383,15 @@ class PipelineGRPOEngine(PipelineEngine):
 
 
         self.pipe_buffers['labels'][buffer_id] = recvd  #here we should put it into labels channel
+
+
+        #start of print info
+        prompt_completion_ids, logits_to_keep, advtg = recvd
+        print(
+            f"pid: {os.getpid()}, recvd_rewards(),recv adv:{advtg}, data hash() : {hash_tensor(prompt_completion_ids)}, shape:{prompt_completion_ids.shape}")
+        #end of print info
+
+
 
         if self.wall_clock_breakdown():
             self.timers('receive rewards').stop()
@@ -1446,8 +1509,6 @@ class PipelineGRPOEngine(PipelineEngine):
         else:
             return self._reward_buffer[idx].flatten()[:numel].view(shape)
 
-
-
     def _prepare_inputs_0(self, inputs):
         """
         Prepare `inputs` before feeding them to the model, converting them to tensors if they are not already and
@@ -1510,11 +1571,9 @@ class PipelineGRPOEngine(PipelineEngine):
         """Progress the pipeline to train the next batch of data. The engine will ingest
         ``self.train_batch_size()`` total samples collectively across all workers.
 
-
         An iterator that over training data should be provided as an argument
         unless ``deepspeed.initialize()`` was provided a training set. In that event,
         the training data will automatically be read.
-
 
         .. warning::
             A total of ``self.gradient_accumulation_steps()`` entries will be pulled
@@ -1555,8 +1614,18 @@ class PipelineGRPOEngine(PipelineEngine):
         self.total_additional_losses = None
         self._compute_loss = True
 
+        #for test of model weight hash value, to verify weight do updates
+        layers_funcs = self.module.forward_funcs
+        weight_hash = hash_tensor(list(layers_funcs[-1].named_parameters())[0][1].data)
+        weight_test_sample = (list(layers_funcs[-1].named_parameters())[0][1].data[0][:10])
+        print(f"name:{str(layers_funcs[-1].__class__).split('.')[-1]},module_name:{list(layers_funcs[-1].named_parameters())[0][0]},module_sum:{list(layers_funcs[-1].named_parameters())[0][1].data.sum()},layers_len:{len(layers_funcs)},stage:{self.stage_id}, step:{self.global_steps}, last layer weight hash:{weight_hash}, weight_test_sample:{weight_test_sample}")
+        #end of test
+
         # Do the work
         self.timers(TRAIN_BATCH_TIMER).start()
+
+
+
 
         #start of upload model to server
         #condition,   global_step%num_iterations==0 and step%gas==0
@@ -1594,6 +1663,22 @@ class PipelineGRPOEngine(PipelineEngine):
                     self._buffered_inputs[0] = collate_data_buffer
             else:
                 collate_data_buffer = self._buffered_inputs[0]
+
+            #start of debug
+            #for debug purpose, store data for evaluation use
+            collate_data_buffer_eval_copy = BatchDataBuffer()
+            collate_data_buffer_eval_copy.max_len = collate_data_buffer.max_len
+            collate_data_buffer_eval_copy.data_num = collate_data_buffer.data_num
+            if collate_data_buffer.buffer:
+                for element in collate_data_buffer.buffer:
+                    collate_data_buffer_eval_copy.buffer.append(copy.deepcopy(element))
+            if collate_data_buffer.new_data_buffer:
+                for element in collate_data_buffer.new_data_buffer:
+                    collate_data_buffer_eval_copy.new_data_buffer.append(copy.deepcopy(element))
+
+            #this is a brand new class data, copy from original, so not mixed with training data, prevent any disturbance
+            self._eval_data_buffer[0] = collate_data_buffer_eval_copy
+            #end of debug
 
             #here since contains all datas, so store in the first place
             self.collate_data_buffer = iter(collate_data_buffer)
@@ -1682,3 +1767,126 @@ class PipelineGRPOEngine(PipelineEngine):
         self._reward_buffer = []
         #data buffer for pipeline, having the same length
         self.collate_data_buffer = None
+        self._eval_data_buffer = [None]  #also reset buffer for evaluation copy data
+
+    def eval_batch(self,
+                   reduce_output='avg',
+                   tokenizer=None,
+                   compute_loss=True,
+                   return_logits=False,
+                   bcast_loss=True,
+                   num_micro_batches=None):
+        """Progress the pipeline to train the next batch of data. The engine will ingest
+        ``self.train_batch_size()`` total samples collectively across all workers.
+
+        An iterator that over training data should be provided as an argument
+        unless ``deepspeed.initialize()`` was provided a training set. In that event,
+        the training data will automatically be read.
+
+
+        .. warning::
+            A total of ``self.gradient_accumulation_steps()`` entries will be pulled
+            from ``data_iter`` by each pipeline. There must be sufficient
+            data left in ``data_iter`` or else a ``StopIteration`` will halt training.
+
+            DeepSpeed provides a convenience class :class:`deepspeed.utils.RepeatingLoader`
+            that wraps data loaders to automatically restart upon a ``StopIteration``.
+
+        Args:
+            data_iter (Iterator, optional): Iterator of training data.
+
+        Returns:
+            The arithmetic mean of the losses computed this batch.
+        """
+        self.module.eval()
+
+
+        self.total_loss = None
+        self.total_additional_losses = None
+        self._compute_loss = True
+
+
+        # Do the work
+        self.timers(EVAL_BATCH_TIMER).start()
+
+        #start of upload model to server
+        #condition,   global_step%num_iterations==0 and step%gas==0
+        #while in pipeline, only   global_step%==num_iterations==0
+
+        #for test
+        #will process gas data within one train_batch() loop
+        #so we first prepare all gas datas before entering schedule commands loops
+        #in old way, each exec_load_micro()will load and prepare one data
+        if self.is_first_stage():
+
+            #the common data is dataset, not data iterator
+            collate_data_buffer = self._eval_data_buffer[0]
+            #end of debug
+
+            # #start of printing store data, just for debugging purpose
+            # store_data_list = collate_data_buffer.new_data_buffer
+            # for store_data in store_data_list:
+            #     send_to_next_stage, send_to_last_stage = store_data
+            #     prompt_completion_ids, logits_to_keep, advtg = send_to_last_stage
+            #     prompt_completion_ids, attention_mask = send_to_next_stage
+            #     data_fat_hash = hash_tensor(prompt_completion_ids)
+            #     data_fat_shape = prompt_completion_ids.shape
+            #     original_seq_len = prompt_completion_ids.shape[1]
+            #     valid_length = max((attention_mask == 1).sum(dim=-1))
+            #     prompt_completion_ids = prompt_completion_ids[:, :valid_length]
+            #     print(
+            #         f"pid: {os.getpid()}, eval_batch() fetch data store, receive adv:{advtg}, data fat hash:{data_fat_hash}, data fat shape:{data_fat_shape},data trim hash() : {hash_tensor(prompt_completion_ids)}, data trim shape:{prompt_completion_ids.shape}")
+            # #end of printing store data
+
+            #here since contains all datas, so store in the first place
+            # temp_data_buffer = self.collate_data_buffer
+            self.collate_data_buffer = iter(collate_data_buffer)
+
+        else:
+            # while True:
+            #     time.sleep(1)
+            pass #for other processes, do nothing
+
+
+        #end of test
+
+        #entering scheduling cmds, will _exec_load_micro_data for gas times
+        #originally call
+
+        # set the number micro batches in case the user chose value than training
+        micro_batches = self.micro_batches if num_micro_batches is None else num_micro_batches
+        self._compute_loss = compute_loss
+        eval_output = None
+
+        sched = grpo_schedule.InferenceSchedule(micro_batches=micro_batches,
+                                       stages=self.num_stages,
+                                       stage_id=self.stage_id)
+
+        # prevent dead-lock with multiple evals sequence
+        dist.barrier()
+
+        with torch.no_grad():
+            self._exec_schedule(sched)
+
+        # self.global_pipeline_step += 1   #added by luke
+
+        self.timers(EVAL_BATCH_TIMER).stop()
+
+        if self.is_last_stage():
+            eval_output = self._reduce_outputs(self.fwd_outputs, reduce=reduce_output, micro_batches=micro_batches)
+
+        if compute_loss and (bcast_loss or self.monitor.enabled):
+            eval_output = self._bcast_pipe_scalar(eval_output)
+
+        if self.global_rank == 0 and self.monitor.enabled:
+            self.summary_events = [(f'Train/Samples/eval_loss', eval_output.mean().item(), self.global_samples)]
+            self.monitor.write_events(self.summary_events)
+
+        # Reset any buffers that may have been populated during the forward passes.
+        #ds_checkpointing.reset()
+        self.eval_return_logits = False
+        if return_logits:
+            outputs = self.outputs
+            self.outputs = None
+            return eval_output, outputs
+        return eval_output

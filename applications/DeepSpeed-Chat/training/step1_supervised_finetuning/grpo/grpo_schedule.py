@@ -131,59 +131,59 @@ class PipeSchedule(ABC):
             self.it = self.steps()
         return next(self.it)
 
-
-class InferenceSchedule(PipeSchedule):
-    """A schedule for inferencing batches using pipeline parallelism.
-    """
-
-    def steps(self):
-        """"""
-        prev_micro_batch_id = -1
-        total_steps = self.micro_batches + self.stages - 1
-        for step_id in range(total_steps):
-            cmds = []
-            micro_batch_id = step_id - self.stage_id
-
-            # Alternate send/recv buffers
-            if _is_even(self.stage_id):
-                recv_buf = step_id % 2
-                send_buf = (step_id + 1) % 2
-            else:
-                recv_buf = (step_id + 1) % 2
-                send_buf = step_id % 2
-
-            if self.is_first_stage or self.is_last_stage:
-                if self._valid_micro_batch(micro_batch_id):
-                    cmds.append(LoadMicroBatch(recv_buf))
-
-            if _is_even(self.stage_id):
-                if self._valid_stage(self.next_stage):
-                    if self._valid_micro_batch(micro_batch_id - 1):
-                        cmds.append(SendActivation(send_buf))
-                if self._valid_stage(self.prev_stage):
-                    if self._valid_micro_batch(micro_batch_id):
-                        cmds.append(RecvActivation(recv_buf))
-            else:
-                if self._valid_stage(self.prev_stage):
-                    if self._valid_micro_batch(micro_batch_id):
-                        cmds.append(RecvActivation(recv_buf))
-
-                if self._valid_stage(self.next_stage):
-                    if self._valid_micro_batch(micro_batch_id - 1):
-                        cmds.append(SendActivation(send_buf))
-
-            if self._valid_micro_batch(micro_batch_id):
-                cmds.append(ForwardPass(recv_buf))
-
-            yield cmds
-
-    def num_pipe_buffers(self):
-        """Only two pipeline buffers are required for inferencing.
-
-        Returns:
-            ``2``
-        """
-        return 2
+#
+# class InferenceSchedule_bk(PipeSchedule):
+#     """A schedule for inferencing batches using pipeline parallelism.
+#     """
+#
+#     def steps(self):
+#         """"""
+#         prev_micro_batch_id = -1
+#         total_steps = self.micro_batches + self.stages - 1
+#         for step_id in range(total_steps):
+#             cmds = []
+#             micro_batch_id = step_id - self.stage_id
+#
+#             # Alternate send/recv buffers
+#             if _is_even(self.stage_id):
+#                 recv_buf = step_id % 2
+#                 send_buf = (step_id + 1) % 2
+#             else:
+#                 recv_buf = (step_id + 1) % 2
+#                 send_buf = step_id % 2
+#
+#             if self.is_first_stage or self.is_last_stage:
+#                 if self._valid_micro_batch(micro_batch_id):
+#                     cmds.append(LoadMicroBatch(recv_buf))
+#
+#             if _is_even(self.stage_id):
+#                 if self._valid_stage(self.next_stage):
+#                     if self._valid_micro_batch(micro_batch_id - 1):
+#                         cmds.append(SendActivation(send_buf))
+#                 if self._valid_stage(self.prev_stage):
+#                     if self._valid_micro_batch(micro_batch_id):
+#                         cmds.append(RecvActivation(recv_buf))
+#             else:
+#                 if self._valid_stage(self.prev_stage):
+#                     if self._valid_micro_batch(micro_batch_id):
+#                         cmds.append(RecvActivation(recv_buf))
+#
+#                 if self._valid_stage(self.next_stage):
+#                     if self._valid_micro_batch(micro_batch_id - 1):
+#                         cmds.append(SendActivation(send_buf))
+#
+#             if self._valid_micro_batch(micro_batch_id):
+#                 cmds.append(ForwardPass(recv_buf))
+#
+#             yield cmds
+#
+#     def num_pipe_buffers(self):
+#         """Only two pipeline buffers are required for inferencing.
+#
+#         Returns:
+#             ``2``
+#         """
+#         return 2
 
 
 class TrainSchedule(PipeSchedule):
@@ -203,6 +203,8 @@ class TrainSchedule(PipeSchedule):
             # forward or backward pass step.
             micro_batch_id, is_forward = self._step_to_micro_batch(step_id)
 
+            # print(
+            #     f"TrainSchedule_1: {self.stage_id}, step_id: {step_id}, micro_batch_id: {micro_batch_id}, is_forward:{is_forward}")
 
             #for reward
             if self.stage_id == 0:
@@ -285,8 +287,9 @@ class TrainSchedule(PipeSchedule):
             # need to determine receive
 
 
-            if self.stage_id >= 0:
-                print(f"stage: {self.stage_id}, step: {step_id}, cmds: {cmds}")
+
+            # if self.stage_id >= 0:
+            #     print(f"TrainSchedule_2  stage: {self.stage_id}, step: {step_id}, cmds: {cmds}")
             # Prepare state for next time
             prev_micro_batch_id = micro_batch_id
             yield cmds
@@ -547,3 +550,135 @@ def _is_even(x):
 
 def _is_odd(x):
     return x % 2 != 0
+
+
+
+
+class InferenceSchedule(PipeSchedule):
+    """A schedule for inferencing batches using pipeline parallelism.
+    """
+
+    def steps(self):
+        """"""
+        prev_micro_batch_id = -1
+        total_steps = self.micro_batches + self.stages - 1
+        for step_id in range(total_steps):
+            cmds = []
+            micro_batch_id = step_id - self.stage_id
+
+            #for reward
+            if self.stage_id == 0:
+                lag_micro_batch_id = step_id - self.num_stages + 1 - self.stage_id
+
+            # Alternate send/recv buffers
+            if _is_even(self.stage_id):
+                recv_buf = step_id % 2
+                send_buf = (step_id + 1) % 2
+            else:
+                recv_buf = (step_id + 1) % 2
+                send_buf = step_id % 2
+
+            if self.stage_id == 0:
+                first_stage_recv_buf = step_id % self.num_pipe_buffers()
+                first_stage_send_buf = (step_id - 1) % self.num_pipe_buffers()
+                first_stage_lag_reward_buf = (step_id - self.num_stages + 1) % self.num_pipe_buffers()
+
+
+            # if _is_even(self.stage_id):
+            #     lag_recv_buf = (step_id - self.num_stages + 1) % 2
+            #     lag_send_buf = (step_id - self.num_stages + 1 + 1) % 2
+            # else:
+            #     lag_recv_buf = (step_id - self.num_stages + 1 + 1) % 2
+            #     lag_send_buf = (step_id - self.num_stages + 1 )% 2
+
+            # print(
+            #     f"InferSchedule_1: {self.stage_id}, step_id: {step_id}, micro_batch_id: {micro_batch_id}, recv_buf:{recv_buf}, send_buf:{send_buf}, lag_recv_buf:{lag_recv_buf}, lag_send_buf:{lag_send_buf}")
+
+
+            #send reward
+            if self.is_first_stage:
+                if self._valid_micro_batch(lag_micro_batch_id):
+                    cmds.append(SendRwd(first_stage_lag_reward_buf))
+
+            if self.is_last_stage:
+                if self._valid_micro_batch(micro_batch_id):
+                    cmds.append(LoadMicroBatch(recv_buf))
+
+            #newly added for reward send
+            if self.is_first_stage:
+                if self._valid_micro_batch(micro_batch_id):
+                    cmds.append(LoadMicroBatch(first_stage_recv_buf))
+
+
+
+            #receive reward
+            if self.stage_id == self.stages - 1:
+                if self._valid_micro_batch(micro_batch_id):
+                    cmds.append(RecvRwd(recv_buf))
+
+            if _is_even(self.stage_id):
+                if self._valid_stage(self.next_stage):
+                    if self._valid_micro_batch(micro_batch_id - 1) and self.stage_id > 0: #change by luke
+                        cmds.append(SendActivation(send_buf))
+                if self._valid_stage(self.prev_stage):
+                    if self._valid_micro_batch(micro_batch_id):
+                        cmds.append(RecvActivation(recv_buf))
+            else:
+                if self._valid_stage(self.prev_stage):
+                    if self._valid_micro_batch(micro_batch_id):
+                        cmds.append(RecvActivation(recv_buf))
+
+                if self._valid_stage(self.next_stage):
+                    if self._valid_micro_batch(micro_batch_id - 1):
+                        cmds.append(SendActivation(send_buf))
+
+            #newly added
+            if self.stage_id == 0:
+                if self._valid_micro_batch(micro_batch_id - 1) and self.stage_id == 0:
+                    cmds.append(SendActivation(first_stage_send_buf))
+
+            if self._valid_micro_batch(micro_batch_id) and self.stage_id > 0:  #chaned by luke
+                cmds.append(ForwardPass(recv_buf))
+            elif self._valid_micro_batch(micro_batch_id) and self.stage_id == 0:
+                cmds.append(ForwardPass(first_stage_recv_buf))
+
+
+            # print(f"InferSchedule_2, stage: {self.stage_id}, step:{step_id}, cmd: {cmds}")
+
+            yield cmds
+
+    def num_pipe_buffers_bk(self):
+        """Only two pipeline buffers are required for inferencing.
+
+        Returns:
+            ``2``
+        """
+
+        return 2
+
+    # def num_pipe_label_reward_buffers(self):
+    #     if self.stage_id == 0:
+    #         buffers = min(self.stages, self.micro_batches)
+    #         num = max(2, buffers)
+    #
+    #     else:
+    #         num = 2
+    #
+    #     #but only first and last stage is effective, none sense for other stages
+    #     return num
+
+    def num_pipe_buffers(self):
+        """Only two pipeline buffers are required for inferencing.
+
+        Returns:
+            ``2``
+        """
+        if self.stage_id == 0:
+            buffers = min(self.stages, self.micro_batches)
+            num = max(2, buffers)
+
+        else:
+            num = 2
+
+        #but only first and last stage is effective, none sense for other stages
+        return num

@@ -726,7 +726,7 @@ def create_dataset_2(local_rank, dataset_name, data_split, output_path,
 
     return train_dataset
 
-def pack_examples(examples: dict[str, list[list]], seq_length: int) -> dict[str, list[list]]:
+def pack_examples(examples: dict[str, list[list]], seq_length: int) -> dict [str, list[list]]:
     """
     Pack examples into chunks of size `seq_length`.
 
