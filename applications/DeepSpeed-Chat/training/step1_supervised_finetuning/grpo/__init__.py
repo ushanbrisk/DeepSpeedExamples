@@ -2,6 +2,7 @@ from .reward import  *
 from .grpo_trainer import  *
 from .PipelineGRPOEngine import *
 from .reward import *
+from .hash import *
 __all__ = ['accuracy_reward',
            'format_reward',
            'tag_count_reward',

@@ -1,7 +1,7 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-model_name = "/ssd/output_test_202504091217_220k"
+# model_name = "/ssd/output_test_202504091217_220k"
 # model_name = "/home/luke/distributed_machine_learning/DeepSpeedExamples/applications/DeepSpeed-Chat/training/step1_supervised_finetuning/convert_model"
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
