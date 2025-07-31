@@ -447,24 +447,18 @@ def loss_fn_parent_policy_gradient(model, temperature=1.0,
         return loss
     return loss_fn
 
-def loss_fn_parent_liger(model, temperature=1.0,
+def loss_fn_parent_liger(model,
                    num_iterations=1,
                    gradient_accumulation_steps=1,
-                   epsilon_low = 0.0,
-                   epsilon_high = 0.0):
+                   liger_loss = None
+                   ):
     if is_peft_model(model):
         embed_tokens = model.base_model.model.model.embed_tokens
     else:
         embed_tokens = model.model.embed_tokens
     weight = embed_tokens.weight
     #here weight is tied with input embedding matrix, now is lm_head
-    liger_grpo_loss = LigerFusedLinearGRPOLoss(
-        beta=0,
-        epsilon_low=epsilon_low,
-        epsilon_high=epsilon_high,
-        temperature=temperature,
-        use_ref_model=False,
-    )
+    liger_grpo_loss = liger_loss
 
     def loss_fn(outputs, labels, old_token_logps, global_pipeline_steps, step):
         # print(f"loss_fn memory: id{id(embed_tokens.weight)}, pid:{os.getpid()}")
@@ -497,15 +491,14 @@ def loss_fn_parent_liger(model, temperature=1.0,
         # slice_indices = slice(-(logits_to_keep+1), None) if isinstance(logits_to_keep, int) else logits_to_keep
         #found it (slice_indeces +1 or not),  does not matter ,when using liger kernel grpo loss
 
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        slice_indices = slice(-(logits_to_keep+1), None) if isinstance(logits_to_keep, int) else logits_to_keep
         hidden_states = hidden_states[:, slice_indices, :] #1 more position
         slice_indices = slice(-(logits_to_keep), None) if isinstance(logits_to_keep, int) else logits_to_keep
         completion_mask = causal_mask[:, slice_indices]
 
-        input_ids = prompt_completion_ids[:, -logits_to_keep:] #[B, logits_to_keep, VOCAB_DIM]
+        input_ids = prompt_completion_ids[:, -logits_to_keep:].contiguous() #[B, logits_to_keep, VOCAB_DIM]
 
-        # hidden_states = hidden_states[...,:-1,:].contiguous()
-        # input_ids = prompt_completion_ids[:, -logits_to_keep:].contiguous()
+        hidden_states = hidden_states[...,:-1,:].contiguous()
         #
         # hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         # input_ids = input_ids.view(-1)
@@ -519,7 +512,7 @@ def loss_fn_parent_liger(model, temperature=1.0,
 
 
         #1.hidden_states  B, L, H
-        #2.weight  H, VOCAB_DIM
+        #2.weight  H, V
 
         loss, metrics = liger_grpo_loss(
             _input=hidden_states,

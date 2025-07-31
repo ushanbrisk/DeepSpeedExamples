@@ -365,7 +365,7 @@ def loss_fn_parent(model, ref_module):
         #     all_logps.append(logps)
         # logps = torch.cat(all_logps, dim=0)
         # return logps
-        lce = LigerFusedLinearCrossEntropyLoss(beta=0.1, reduction="mean")
+        lce = LigerFusedLinearCrossEntropyLoss(beta=1.0, reduction="mean")
         loss = lce(weight, shift_hidden_states, shift_labels, ref_hidden, ref_lm_head.weight)
         # loss = lce(weight, shift_hidden_states, shift_labels)
         return loss

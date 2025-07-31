@@ -46,6 +46,8 @@ from pipelayers import (get_model,get_model_loss_fn, DataCollatorForPromptDatase
                         )
 
 from ReferModel import PipelineSFTRefModelEngine
+from transformers import AutoConfig
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -54,8 +56,8 @@ def parse_args():
     parser.add_argument('--data_path',
                         nargs='*',
                         # default=['Dahoas/rm-static'],
-                        # default = ['lukedai/test'],
-                        default = ['open-r1/OpenR1-Math-220k'],
+                        default = ['lukedai/test'],
+                        # default = ['open-r1/OpenR1-Math-220k'],
                         help='Path to the training dataset. Accepted format:'
                         '1) a single data path, 2) multiple datasets in the'
                         'form: dataset1-path dataset2-path ...')
@@ -92,7 +94,7 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="Qwen/Qwen2.5-0.5B-Instruct",
+        default="Qwen/Qwen2.5-1.5B-Instruct",
         help=
         "Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
@@ -100,13 +102,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=2,
+        default=4,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=2,
+        default=4,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -134,7 +136,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=2,
+        default=4,
         help=
         "Number of updates steps to accumulate before performing a backward/update pass.",
     )
@@ -253,7 +255,7 @@ def parse_args():
 
     parser.add_argument('--num_stages',
                         type = int,
-                        default=2,
+                        default=6,
                         help='pipeline stages.')
     parser.add_argument('--save_model_step',
                         type = int,
@@ -295,7 +297,10 @@ def main():
     torch.distributed.barrier(device_ids=[args.global_rank])
     # torch.distributed.barrier()
     # load_hf_tokenizer will get the correct tokenizer and set padding tokens based on the model family
-    args.end_of_conversation_token = "<|endoftext|>"
+
+    #will not use that
+    #args.end_of_conversation_token = "<|endoftext|>"
+
     additional_special_tokens = args.end_of_conversation_token if args.add_eot_token else None
     tokenizer = load_hf_tokenizer(args.model_name_or_path,
                                   fast_tokenizer=True,
@@ -303,6 +308,7 @@ def main():
     torch_dtype = (
         args.torch_dtype if args.torch_dtype in ["auto", None] else getattr(torch, args.torch_dtype)
     )
+
     model = create_hf_model(AutoModelForCausalLM,
                             args.model_name_or_path,
                             tokenizer,
@@ -313,9 +319,8 @@ def main():
                             torch_dtype=torch_dtype,
                             use_liger_kernel=args.use_liger_kernel,
                             gradient_checkpointing = args.gradient_checkpointing)
-
-
-
+    #for save usage
+    base_config = AutoConfig.from_pretrained(args.model_name_or_path)
 
     if args.compute_fp32_loss:
         print_rank_0(
@@ -477,6 +482,7 @@ def main():
 
 
     for step in range(args.num_train_epochs * num_update_steps_per_epoch-1):  #-1 is importtant , abandon last residual to avoid error
+    # for step in range(1):  # -1 is importtant , abandon last residual to avoid error
         torch.cuda.empty_cache()
         start1 = time.time()
         print_rank_0(
@@ -509,13 +515,18 @@ def main():
             print(f"Saving at step {step}")
             engine.save_checkpoint(args.output_dir)
 
-
             if args.global_rank == 0 and engine.global_steps <= args.save_model_step:
-                tokenizer.save_vocabulary(args.output_dir)
-                CONFIG_NAME = "config.json"
-                output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-                model.config.to_json_file(output_config_file)
+                # # tokenizer.save_vocabulary(args.output_dir)
+                # tokenizer.save_pretrained(args.output_dir)
+                # CONFIG_NAME = "config.json"
+                # output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+                # model.config.to_json_file(output_config_file)
+                # tokenizer.save_vocabulary(args.output_dir)
+                tokenizer.save_pretrained(args.output_dir)
 
+                base_config.save_pretrained(args.output_dir)
+
+                model.generation_config.save_pretrained(args.output_dir)
 
     if args.output_dir is not None:
         print_rank_0('saving the final model ...', args.global_rank)
@@ -525,11 +536,32 @@ def main():
     print(f"finished saving model")
 
     if args.global_rank == 0:
-        tokenizer.save_vocabulary(args.output_dir)
-        CONFIG_NAME = "config.json"
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-        model.config.to_json_file(output_config_file)
+        tokenizer.save_pretrained(args.output_dir)
+
+        # generate config.json
+        # current model
+        # CONFIG_NAME = "config_training_model.json"
+        # output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+        # model.config.to_json_file(output_config_file)
+
+        # base model
+
+        base_config.save_pretrained(args.output_dir)
+
+        # generation_config.json
+        # GENERATE_CONFIG_NAME = "generation_config_training_model.json"
+        # output_config_file = os.path.join(args.output_dir, GENERATE_CONFIG_NAME)
+        model.generation_config.save_pretrained(args.output_dir)
+
+        # # base model  been proved no difference with trained model
+        # GENERATE_CONFIG_NAME = "generation_config_base_model"
+        # output_config_file = os.path.join(args.output_dir, GENERATE_CONFIG_NAME)
+        # model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
+        # model.generation_config.save_pretrained(output_config_file)
+
         print(f"finished save vocabulary config and model config")
+
+
     torch.distributed.barrier(device_ids=[args.global_rank])
     print(f"done after sync, will exit programm ")
 

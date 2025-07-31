@@ -6,7 +6,9 @@ from shutil import copy
 import argparse
 import json
 from transformers import set_seed, AutoTokenizer, AutoConfig, AutoModelForCausalLM
-
+from transformers import AutoModel
+from safetensors.torch import save_file
+from training.step1_supervised_finetuning.grpo import hash_tensor
 
 def convert_model_to_hf(pipeline_model_dir, save_model_dir):
     model_static_dict = {}
@@ -18,16 +20,32 @@ def convert_model_to_hf(pipeline_model_dir, save_model_dir):
         layer_i = int(path.name.split('-')[0].replace('layer_', ''))
         if layer_i == 0:
             model_static_dict["model.embed_tokens.weight"] = small_static_dict["embed_tokens.weight"]
-        elif layer_i == 26:
+        elif layer_i == 30:
             model_static_dict["lm_head.weight"] = small_static_dict["embed_tokens.weight"]
-        elif layer_i == 25: #norm layer
+        elif layer_i == 29: #norm layer
             model_static_dict['model.norm.weight'] = small_static_dict['norm.weight']
 
-        elif layer_i <=24 and layer_i >= 1:
+        elif layer_i <=28 and layer_i >= 1:
             for k, v in small_static_dict.items():
                 model_static_dict["model." + k.replace("layer.", "layers.{}.".format(layer_i - 1), 1)] = v
     #
-    torch.save(model_static_dict, join(save_model_dir, "pytorch_model.bin"))
+
+    # config = AutoConfig.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    # model = AutoModel.from_config(config)
+
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    old_hash = hash_tensor(model.lm_head.weight.data)
+
+    model.load_state_dict(model_static_dict)
+    new_hash = hash_tensor(model.lm_head.weight.data)
+
+    print(f"old hash:{old_hash}, new hash:{new_hash}")
+    # state_dict = model.state_dict()
+    # save_file(state_dict, join(save_model_dir,"model.safetensors"))
+    model.save_pretrained(save_model_dir, safe_serialization=False)
+
+
+    # torch.save(model_static_dict, join(save_model_dir, "pytorch_model.bin"))
 
 # do not consider lora layer
 #     model = convert_lora_to_linear_layer(model)
@@ -35,7 +53,7 @@ def convert_model_to_hf(pipeline_model_dir, save_model_dir):
 def get_tokenizer(model_name_or_path, fast_tokenizer=True):
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path, fast_tokenizer=fast_tokenizer)
-    tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.pad_token = tokenizer.eos_token
     # make sure tokenizer is right pad in our logic, this is not implemented in openr1,
     # tokenizer.padding_side = 'right'
     return tokenizer
@@ -66,8 +84,8 @@ def test_load_model(model_path):
 def set_args():
     parser = argparse.ArgumentParser()
     # parser.add_argument('--ori_model_dir', default='/ssd/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306', type=str, help='')
-    parser.add_argument('--pipeline_model_dir', default='/ssd2/output_test_202507241723_debug/global_step320', type=str, help='')
-    parser.add_argument('--save_model_dir', default='/ssd2/debug_20250725', type=str, help='')
+    parser.add_argument('--pipeline_model_dir', default='/ssd2/debug_20250723_sft/global_step1', type=str, help='')
+    parser.add_argument('--save_model_dir', default='/ssd2/debug_20250723_sft', type=str, help='')
     return parser.parse_args()
 
 

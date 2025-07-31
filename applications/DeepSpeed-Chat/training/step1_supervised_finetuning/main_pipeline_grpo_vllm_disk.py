@@ -48,6 +48,17 @@ from pipelayers_grpo import (convert_model_to_hf_qwen25_500m,
 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 from pathlib import Path
 
+#for liger-kernel loss
+from transformers.utils.import_utils import _is_package_available
+from packaging import version
+LIGER_KERNEL_MIN_VERSION = "0.5.6"
+_is_liger_kernel_available, _liger_kernel_version = _is_package_available("liger_kernel", return_version=True)
+def is_liger_kernel_available(min_version: str = LIGER_KERNEL_MIN_VERSION) -> bool:
+    return _is_liger_kernel_available and version.parse(_liger_kernel_version) >= version.parse(min_version)
+
+from ligerloss import LigerFusedLinearGRPOLoss
+#end of liger kernel
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=
@@ -258,7 +269,7 @@ def parse_args():
                         help='Prints loss at each step.')
 
     parser.add_argument('--num_stages',
-                        default=4,
+                        default=5,
                         help='pipeline stages.')
     parser.add_argument('--save_model_step',
                         default=1,
@@ -446,6 +457,7 @@ def main():
         vllm_client = VLLMClient(
             '0.0.0.0', 8000, connection_timeout=1200.0
         )
+        vllm_client.init_communicator()
         prompts = [
             "Hello, my name is",
             "The president of the United States is",
@@ -575,17 +587,25 @@ def main():
     # print(model)
     #loss = loss_fn(outputs, label)
     if args.custom_loss_fn:
+
+        if args.use_liger_kernel:
+            liger_grpo_loss = LigerFusedLinearGRPOLoss(
+                beta=0,
+                epsilon_low=args.epsilon_low,
+                epsilon_high=args.epsilon_high,
+                temperature=args.temperature,
+                use_ref_model=False,
+            )
+
         model_pipe = PipelineModule(layers=get_model_loss_fn(model),
                                     num_stages=int(args.num_stages),
                                     # activation_checkpoint_interval = 4
-                                    loss_fn=loss_fn_parent(model,
-                                                           temperature=args.temperature,
+                                    loss_fn=loss_fn_parent_liger(model,
                                                            num_iterations=args.num_iterations,
                                                            gradient_accumulation_steps=args.gradient_accumulation_steps,
-                                                           epsilon_low=args.epsilon_low,
-                                                           epsilon_high=args.epsilon_high,
+                                                           liger_loss = liger_grpo_loss,
                                                            ) if args.use_liger_kernel
-                                    else loss_fn_parent_liger(model,
+                                    else loss_fn_parent(model,
                                                            temperature=args.temperature,
                                                            num_iterations=args.num_iterations,
                                                            gradient_accumulation_steps=args.gradient_accumulation_steps,

@@ -2,6 +2,9 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
+#this version addes eval_batch(), but has no effect, since .deteach() value in loss_fn() could not perssist
+
+
 # DeepSpeed Team
 import argparse
 import math
