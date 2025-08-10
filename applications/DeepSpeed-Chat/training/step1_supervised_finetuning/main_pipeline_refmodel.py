@@ -47,7 +47,7 @@ from pipelayers import (get_model,get_model_loss_fn, DataCollatorForPromptDatase
 
 from ReferModel import PipelineSFTRefModelEngine
 from transformers import AutoConfig
-
+from all_modules import RefPipelineModule
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -402,7 +402,7 @@ def main():
             param = embed_tokens_ref_model.get_parameter(param_name)
             param.requires_grad = False
 
-        model_pipe = PipelineModule(layers=get_model_loss_fn(model),
+        model_pipe = RefPipelineModule(layers=get_model_loss_fn(model),
                                     num_stages=args.num_stages,
                                     # activation_checkpoint_interval = 4
                                     # loss_fn=loss_fn_parent_ref_model(model)
@@ -410,7 +410,7 @@ def main():
                                     # loss_fn = loss_fn_parent_no_ref(model)
                                     )
     else:
-        model_pipe = PipelineModule(layers=get_model(model),
+        model_pipe = RefPipelineModule(layers=get_model(model),
                                     num_stages=args.num_stages,
                                     # activation_checkpoint_interval = 4
                                     )

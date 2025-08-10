@@ -903,6 +903,53 @@ class Openr1Openr1math220kDataset(MessageRawDataset):
         result = maybe_apply_chat_template((sample), tokenizer=tokenizer)
         return result
 
+class RicdomolmMath500Dataset(MessageRawDataset):
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        super().__init__(output_path, seed, local_rank, dataset_name)
+        self.dataset_name = "ricdomolm/MATH-500"
+        self.dataset_name_clean = "ricdomolm/MATH-500"
+        # self.tokenizer = AutoTokenizer.from_pretrained(  #?????????????????????????????
+        #     # "facebook/opt-1.3b",
+        #     "Qwen/Qwen2.5-0.5B-Instruct",
+        #     revision= "main",
+        #     trust_remote_code=True,
+        # )
+        # self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def get_train_data(self):
+        return self.raw_datasets["train"]
+
+    def get_eval_data(self):
+        if "test" in self.raw_datasets:
+            return self.raw_datasets["test"]
+        else:
+            return self.raw_datasets["train"]  #?????????
+
+    # def get_prompt(self, sample):
+    #     return sample['prompt']
+    #
+    # def get_chosen(self, sample):
+    #     return sample['chosen']
+    #
+    # def get_rejected(self, sample):
+    #     return sample['rejected']
+
+    # def get_prompt_and_chosen(self, sample, tokenizer):
+    #     # dataset = dataset.map(
+    #     #     maybe_apply_chat_template,
+    #     #     fn_kwargs={"tokenizer": processing_class},
+    #     #     remove_columns="messages" if "messages" in dataset.column_names else None,  # renamed to "text"
+    #     #     **map_kwargs,
+    #     # )
+    #
+    #     result = maybe_apply_chat_template((sample), tokenizer=tokenizer)
+    #     return result
+
+    # def get_prompt_and_rejected(self, sample):
+    #     return sample['prompt'] + sample['rejected']
+
+
+
 
 
 def maybe_apply_chat_template(

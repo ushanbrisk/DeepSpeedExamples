@@ -21,7 +21,8 @@ from transformers import (
     default_data_collator,
     get_scheduler,
     DataCollatorWithPadding,
-    DataCollatorForLanguageModeling
+    DataCollatorForLanguageModeling,
+    AutoConfig
 )
 
 import deepspeed
@@ -35,7 +36,7 @@ from dschat.utils.module.lora import convert_linear_layer_to_lora, convert_lora_
 from dschat.utils.model.model_utils import create_hf_model, causal_lm_model_to_fp32_loss
 # from dschat.utils.perf import print_throughput
 # from pipelayers import PreEmbeddingPipeLayer, DecoderPipeLayer, NormPipeLayer, LMHeadPipeLayer, LossPipeLayer
-from pipelayers_grpo import get_model,get_model_loss_fn, DataCollatorForPromptDataset,DataCollatorForPromptDatasetDummy, print_mem, loss_fn_parent, loss_fn_parent_liger
+from pipelayers_grpo import get_model,get_model_loss_fn, DataCollatorForPromptDataset,DataCollatorForPromptDatasetDummy, print_mem, loss_fn_parent, loss_fn_parent_liger,loss_fn_parent_policy_gradient
 from grpo import get_reward_funcs, enable_gradient_checkpointing,check_module_requires_grad,PipelineGRPOEngine
 from peft import LoraConfig, PeftConfig, get_peft_model
 from accelerate.utils import is_peft_model
@@ -44,6 +45,7 @@ from pipelayers_grpo import (convert_model_to_hf_qwen25_500m,
                              convert_model_to_hf_qwen25_3b,
                              convert_model_to_hf_qwen25_3b_no_bin,
                              convert_model_to_hf_qwen25_500m_no_bin,
+                             convert_model_to_hf_deepseek_1500m_no_bin,
                              TestSampler)
 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 from pathlib import Path
@@ -66,8 +68,9 @@ def parse_args():
     parser.add_argument('--data_path',
                         nargs='*',
                         # default=['Dahoas/rm-static'],
-                        default = ['lukedai/test'],
+                        # default = ['lukedai/test'],
                         # default = ['open-r1/OpenR1-Math-220k'],
+                        default = ["ricdomolm/MATH-500"],
                         help='Path to the training dataset. Accepted format:'
                         '1) a single data path, 2) multiple datasets in the'
                         'form: dataset1-path dataset2-path ...')
@@ -104,8 +107,10 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="Qwen/Qwen2.5-3B-Instruct",
+        # default="Qwen/Qwen2.5-3B-Instruct",
         # default="lukedai/qwen2.5-3b-sft",
+        default="lukedai/model_deepseek_1.5b",
+        # default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7b",
         help=
         "Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
@@ -323,7 +328,7 @@ def parse_args():
                         help='vllm parameter ')
 
     parser.add_argument('--max_completion_length',
-                        default=2048,
+                        default=1024,
                         help='vllm parameter ')
 
 
@@ -378,10 +383,10 @@ def main():
     args.end_of_conversation_token = "<|endoftext|>"
     additional_special_tokens = args.end_of_conversation_token if args.add_eot_token else None
 
-    tokenizer_model_name = "Qwen/Qwen2.5-3B-Instruct" if args.model_name_or_path == "lukedai/qwen2.5-3b-sft" else args.model_name_or_path
+    # tokenizer_model_name = "Qwen/Qwen2.5-3B-Instruct" if args.model_name_or_path == "lukedai/qwen2.5-3b-sft" else args.model_name_or_path
 
-    tokenizer = load_hf_tokenizer(tokenizer_model_name,
-                                  fast_tokenizer=True,
+    tokenizer = load_hf_tokenizer(args.model_name_or_path,
+                                  fast_tokenizer=False,
                                   add_special_tokens=additional_special_tokens)
 
 
@@ -409,6 +414,11 @@ def main():
                             torch_dtype=torch_dtype,
                             use_liger_kernel=args.use_liger_kernel,
                             gradient_checkpointing = args.gradient_checkpointing)
+
+    #for save usage
+    base_config = AutoConfig.from_pretrained(args.model_name_or_path)
+
+
 
     if args.global_rank == 0:
         for name, param in model.named_parameters():
@@ -469,7 +479,7 @@ def main():
         responses_txt = tokenizer.batch_decode(responses)
         print("Test vllm Server Responses:", responses_txt)  # noqa
 
-    test_updating = True
+    test_updating = True  #temprary shutdown
     if test_updating and args.global_rank == 0 and args.use_vllm:
         # test for updating model parameter
         if is_peft_model(model):
@@ -525,6 +535,9 @@ def main():
         args.max_seq_len,
         end_of_conversation_token=tokenizer.eos_token,
         sft_only_data_path=args.sft_only_data_path)
+
+
+
 
     #for grpo reward debug purpose
     if "messages" in train_dataset.column_names:
@@ -597,14 +610,24 @@ def main():
                 use_ref_model=False,
             )
 
-        model_pipe = PipelineModule(layers=get_model_loss_fn(model),
+        model_pipe = PipelineModule(layers=get_model_loss_fn(model, is_tied_embedding=base_config.tie_word_embeddings),
                                     num_stages=int(args.num_stages),
                                     # activation_checkpoint_interval = 4
-                                    loss_fn=loss_fn_parent_liger(model,
-                                                           num_iterations=args.num_iterations,
-                                                           gradient_accumulation_steps=args.gradient_accumulation_steps,
-                                                           liger_loss = liger_grpo_loss,
-                                                           ) if args.use_liger_kernel
+                                    # loss_fn=loss_fn_parent_liger(model,
+                                    #                        num_iterations=args.num_iterations,
+                                    #                        gradient_accumulation_steps=args.gradient_accumulation_steps,
+                                    #                        liger_loss = liger_grpo_loss,
+                                    #                        is_tied= base_config.tie_word_embeddings
+                                    #                        ) if args.use_liger_kernel
+                                    #
+                                    loss_fn = loss_fn_parent_policy_gradient(model,
+                                                                             temperature=args.temperature,
+                                                                             num_iterations = args.num_iterations,
+                                                                             gradient_accumulation_steps=args.gradient_accumulation_steps,
+                                                                             epsilon_low = args.epsilon_low,
+                                                                             epsilon_high = args.epsilon_high,
+                                                                             is_tied = base_config.tie_word_embeddings
+                                                                            ) if args.use_liger_kernel
                                     else loss_fn_parent(model,
                                                            temperature=args.temperature,
                                                            num_iterations=args.num_iterations,
@@ -730,48 +753,47 @@ def main():
 
             #only for process 0 and at the begining of training
             if args.global_rank == 0 and engine.global_steps <= args.save_model_step:
-                tokenizer.save_vocabulary(args.output_dir)
-                CONFIG_NAME = "config.json"
-                output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-                model.config.to_json_file(output_config_file)
+                tokenizer.save_pretrained(args.output_dir)
+                base_config.save_pretrained(args.output_dir)
+                model.generation_config.save_pretrained(args.output_dir)
 
-            COLLECT_PARAMS = False
-            if COLLECT_PARAMS:
-                #start of saving params directly ,replacing engine.save_checkpoint()
-                if args.global_rank >= 0:
-                    module = engine.module
-                    num_layers = len(module.forward_funcs)
-                    start, end = 0, num_layers
-                    layer_list = module.forward_funcs[start:end]
-                    model_static_dict = {}
-                    for idx, layer in enumerate(layer_list):
-                        model_ckpt_path = module.ckpt_layer_path(ckpt_dir='/tmp',local_layer_idx=start + idx)
-                        layer_i = int(model_ckpt_path.split('/')[-1].split('-')[0].replace('layer_', ''))
-                        orig_state_dict = layer.state_dict()
-                        final_state_dict = clone_tensors_for_torch_save(orig_state_dict)
-                        print("已经处理layer：{}".format(layer_i))
-                        if layer_i == 0:
-                            model_static_dict["model.embed_tokens.weight"] = final_state_dict["embed_tokens.weight"]
-                        elif layer_i <= 24 and layer_i >= 1:
-                            for k, v in final_state_dict.items():
-                                model_static_dict["model." + k.replace("layer.", "layers.{}.".format(layer_i - 1), 1)] = v
-                        elif layer_i == 25:  # norm layer
-                            model_static_dict['model.norm.weight'] = final_state_dict['norm.weight']
-                        elif layer_i == 26:
-                            model_static_dict["lm_head.weight"] = final_state_dict["embed_tokens.weight"]
-                    #each process has its own layer in model_static_dict
-                    #need to collect them into process 0
-                if args.global_rank == 0 and args.use_vllm:
-                    for k, v in model_static_dict.items():
-                        v = v.to(device)
-                        vllm_client.update_named_param(k, v.data)
-
-                #the problem here:
-                # 1. vllm server can only receive from one device
-                # mutiple stages params needs to first gather to one device,
-                # waste memory
-                #
-                # this version is not working
+            # COLLECT_PARAMS = False
+            # if COLLECT_PARAMS:
+            #     #start of saving params directly ,replacing engine.save_checkpoint()
+            #     if args.global_rank >= 0:
+            #         module = engine.module
+            #         num_layers = len(module.forward_funcs)
+            #         start, end = 0, num_layers
+            #         layer_list = module.forward_funcs[start:end]
+            #         model_static_dict = {}
+            #         for idx, layer in enumerate(layer_list):
+            #             model_ckpt_path = module.ckpt_layer_path(ckpt_dir='/tmp',local_layer_idx=start + idx)
+            #             layer_i = int(model_ckpt_path.split('/')[-1].split('-')[0].replace('layer_', ''))
+            #             orig_state_dict = layer.state_dict()
+            #             final_state_dict = clone_tensors_for_torch_save(orig_state_dict)
+            #             print("已经处理layer：{}".format(layer_i))
+            #             if layer_i == 0:
+            #                 model_static_dict["model.embed_tokens.weight"] = final_state_dict["embed_tokens.weight"]
+            #             elif layer_i <= 24 and layer_i >= 1:
+            #                 for k, v in final_state_dict.items():
+            #                     model_static_dict["model." + k.replace("layer.", "layers.{}.".format(layer_i - 1), 1)] = v
+            #             elif layer_i == 25:  # norm layer
+            #                 model_static_dict['model.norm.weight'] = final_state_dict['norm.weight']
+            #             elif layer_i == 26:
+            #                 model_static_dict["lm_head.weight"] = final_state_dict["embed_tokens.weight"]
+            #         #each process has its own layer in model_static_dict
+            #         #need to collect them into process 0
+            #     if args.global_rank == 0 and args.use_vllm:
+            #         for k, v in model_static_dict.items():
+            #             v = v.to(device)
+            #             vllm_client.update_named_param(k, v.data)
+            #
+            #     #the problem here:
+            #     # 1. vllm server can only receive from one device
+            #     # mutiple stages params needs to first gather to one device,
+            #     # waste memory
+            #     #
+            #     # this version is not working
 
             #process 0 read from separate files and update to vllm server
             WRITE_TO_DISK=True
@@ -786,9 +808,9 @@ def main():
             #     # Reset cache on main process
             #     vllm_client.reset_prefix_cache()
             if args.global_rank == 0 and args.use_vllm and WRITE_TO_DISK:
-                #read state dict data of each layer from disk files, and save into bin
+                #read state dict data of each layer from disk files, and save into pytorch.bin file
                 # convert_model_to_hf_qwen25_500m(new_folder, args.output_dir)
-                model_static_dict = convert_model_to_hf_qwen25_3b_no_bin(new_folder)
+                model_static_dict = convert_model_to_hf_deepseek_1500m_no_bin(new_folder)
                 #
                 # test_result = model_static_dict.get('model.layers.0.self_attn.q_proj.weight')[0, :4]
                 # print(f"test result: {test_result}")
@@ -816,10 +838,9 @@ def main():
     print(f"finished saving model")
 
     if args.global_rank == 0:
-        tokenizer.save_vocabulary(args.output_dir)
-        CONFIG_NAME = "config.json"
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-        model.config.to_json_file(output_config_file)
+        tokenizer.save_pretrained(args.output_dir)
+        base_config.save_pretrained(args.output_dir)
+        model.generation_config.save_pretrained(args.output_dir)
         print(f"finished save vocabulary config and model config")
     torch.distributed.barrier(device_ids=[args.global_rank])
     print(f"done after sync, will exit programm ")

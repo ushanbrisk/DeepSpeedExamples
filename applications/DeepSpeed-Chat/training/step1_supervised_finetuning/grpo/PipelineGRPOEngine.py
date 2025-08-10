@@ -156,6 +156,18 @@ class PipelineGRPOEngine(PipelineEngine):
 
             #print is to show the length of answer, to see whether it reach maximum limit
             print(f"answer shape:{[len(ele) for ele in completion_ids]}")
+
+
+
+            # #for monitoring generated answer, for debug usage
+            # sen_i = 0
+            # for sentence in completion_ids:
+            #     answer = self.processing_class.decode(sentence, skip_special_tokens=True)
+            #     print(f"{sen_i}: {answer}")
+            #     sen_i += 1
+            #end of monitoring for debug usage
+
+
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
@@ -262,7 +274,7 @@ class PipelineGRPOEngine(PipelineEngine):
 #start of logging
         total_log = f"prompt:{prompts[0][1]['content']}\n\n\n\n"
         for i_ans in range(len(prompts)):
-            one_ans = f"    idx:[{i_ans}]-------------------\n        completion: {completions[i_ans][0]['content']}\n        reward:{rewards_per_func[i_ans]}\n\n"
+            one_ans = f"    idx:[{i_ans}]-------------------\n        completion: {completions[i_ans][0]['content']}\n        reward:{rewards_per_func[i_ans]}\n       answer:{inputs[i_ans]['answer']}\n"
             total_log = total_log + one_ans
         print(total_log)
 #end of logging

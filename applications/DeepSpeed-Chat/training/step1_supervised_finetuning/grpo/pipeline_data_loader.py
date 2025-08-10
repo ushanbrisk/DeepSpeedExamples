@@ -14,7 +14,7 @@ class BatchDataBuffer():
         self.data_num = 0
 
     def add(self, data):
-        self.buffer.append(data)
+        self.buffer.append(data)  #storing [batch1, batch2, batch3,...batch_gas]
 
     def adjust(self, padding_value=0):
         data_num = len(self.buffer)
@@ -23,6 +23,7 @@ class BatchDataBuffer():
         new_prompt_completion_id = []
         prompt_completion_id = [data[0][0] for data in self.buffer]
         length_before_padding = [data.shape[1] for data in prompt_completion_id]
+        #pad each batch data, so total gas data has  the same length
         prompt_completion_id = pad(prompt_completion_id, padding_value=padding_value)
         max_length = prompt_completion_id.shape[2]
         for i in range(prompt_completion_id.shape[0]):
