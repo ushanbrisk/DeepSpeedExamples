@@ -8,6 +8,8 @@ __all__ = ['PreEmbeddingPipeLayer',
 
            'LossPipeLayer',
            'loss_fn_parent',
+           'loss_fn_parent_distill',
+           'loss_fn_parent_distill_vanilla',
            'DataCollatorForPromptDataset',
            'convert_model_to_hf',
            'test_load_model',

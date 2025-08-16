@@ -37,7 +37,7 @@ PIPE_RECV_GRAD_TIMER = 'pipe_recv_grad'
 # The buffer size to store the meta data for each tensor.
 TENSOR_META_SIZE = 256
 
-class PipelineSFTRefModelEngine(PipelineEngine):
+class PipelineDistillModelEngine(PipelineEngine):
 
     def __init__(self,
                  has_bool_tensors=False,
@@ -62,6 +62,7 @@ class PipelineSFTRefModelEngine(PipelineEngine):
 
         self.pipe_recv_buf_ref_model = None #used for ref model
 
+        self._grad_layer_buf_ref_model = [] #used for distill meta tensor
 
     def reset_activation_shape(self):
         """Reset the buffers when the shape of activation and gradient change.
@@ -71,6 +72,7 @@ class PipelineSFTRefModelEngine(PipelineEngine):
         super().reset_activation_shape()
         if self.use_ref_model:
             self.pipe_recv_buf_ref_model = None
+            self._grad_layer_buf_ref_model = []
 
     def train_batch(self, data_iter=None, tokenizer=None):
         """Progress the pipeline to train the next batch of data. The engine will ingest
@@ -301,9 +303,19 @@ class PipelineSFTRefModelEngine(PipelineEngine):
             self.pipe_buffers['inputs'][buffer_id] = inputs
 
         # inputs has no gradient because it is from a cloned tensor
+
         outputs = super(PipelineEngine, self).forward(inputs)
+
+        # print(
+        #     f"stage_id: {self.stage_id}, buffer_id:{buffer_id}, student forward_pass time comsumed = {end1 - start1}"
+        # )
         if self.use_ref_model:
+
             outputs_ref = self.module.forward_ref_model(inputs_ref)
+
+            # print(
+            #     f"stage_id: {self.stage_id}, buffer_id:{buffer_id}, teacher forward_pass time comsumed = {end1 - start1}"
+            # )
 
         # Reset activation checkpointing buffers.
         # Need to call this between evaluation iterations
@@ -460,7 +472,9 @@ class PipelineSFTRefModelEngine(PipelineEngine):
 
         if self.dynamic_shape or self.first_output_send:
             self.first_output_send = False
-            self._send_tensor_meta(outputs, self.next_stage)
+            self._send_tensor_meta_double(outputs, outputs_ref, self.next_stage)
+
+            # self._send_tensor_meta(outputs_ref, self.next_stage)
 
         if isinstance(outputs, torch.Tensor):
             p2p.send(outputs, self.next_stage)
@@ -481,9 +495,6 @@ class PipelineSFTRefModelEngine(PipelineEngine):
             else:
                 raise NotImplementedError('Could not send output of type '
                                           f'{type(outputs_ref)}')
-
-
-
 
         # Restore the boolean tensor
         if self.has_attention_mask or self.has_bool_tensors:
@@ -507,10 +518,10 @@ class PipelineSFTRefModelEngine(PipelineEngine):
 
         # Allocate the buffer if necessary
         if self.dynamic_shape or self.pipe_recv_buf is None:
-            self.pipe_recv_buf = self._recv_tensor_meta(self.prev_stage)
             if self.use_ref_model:
-                self.pipe_recv_buf_ref_model = copy.deepcopy(self.pipe_recv_buf)
-
+                self.pipe_recv_buf, self.pipe_recv_buf_ref_model = self._recv_tensor_meta_double(self.prev_stage)
+            else:
+                self.pipe_recv_buf = self._recv_tensor_meta(self.prev_stage)
 
         if isinstance(self.pipe_recv_buf, torch.Tensor):
             p2p.recv(self.pipe_recv_buf, self.prev_stage)
@@ -584,6 +595,150 @@ class PipelineSFTRefModelEngine(PipelineEngine):
 
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_INPUT_TIMER).stop()
+
+    #_send_tensor_meta(), send 2 times, seperately
+    def _send_tensor_meta_double(self, buffer1, buffer2, recv_stage):
+        """ Communicate metadata about upcoming p2p transfers.
+
+        Metadata is communicated in this order:
+            * type (0: tensor, 1: list)
+            * num_tensors if type=list
+            foreach tensor in buffer:
+                * ndims
+                * shape
+        """
+        meta_buffer = torch.empty(TENSOR_META_SIZE, dtype=torch.int32, device=self.device)
+        # if isinstance(buffer, torch.Tensor):
+        #     meta_buf_list = [
+        #         0,  # type of data (0: tensor, 1: list (unused), 2: tuple)
+        #         self.DTYPE_TO_ID[buffer.dtype],  # dtype
+        #         len(buffer.size())  # ndims
+        #     ]
+        #     meta_buf_list.extend(buffer.size())
+        #     assert len(
+        #         meta_buf_list
+        #     ) <= TENSOR_META_SIZE, f"Buffer for metadata is too small. Current buffer size: {TENSOR_META_SIZE} but required {len(meta_buf_list)}"
+        #     meta_buffer[:len(meta_buf_list)].copy_(torch.tensor(meta_buf_list, dtype=torch.int32))
+        #     p2p.send(meta_buffer, recv_stage)
+
+        if isinstance(buffer1, tuple) and isinstance(buffer2, tuple):
+            meta_buf_list = [
+                2,  # type of data (0: tensor, 1: list (unused), 2: tuple)
+                len(buffer1)  # num_tensors
+            ]
+            for tensor in buffer1:
+                assert isinstance(tensor, torch.Tensor)
+                meta_buf_list.append(self.DTYPE_TO_ID[tensor.dtype])
+                meta_buf_list.append(len(tensor.size()))
+                meta_buf_list.extend(tensor.size())
+
+            meta_buf_list.extend( [
+                2,  # type of data (0: tensor, 1: list (unused), 2: tuple)
+                len(buffer2)  # num_tensors
+            ])
+            for tensor in buffer2:
+                assert isinstance(tensor, torch.Tensor)
+                meta_buf_list.append(self.DTYPE_TO_ID[tensor.dtype])
+                meta_buf_list.append(len(tensor.size()))
+                meta_buf_list.extend(tensor.size())
+
+
+            assert len(
+                meta_buf_list
+            ) <= TENSOR_META_SIZE, f"Buffer for metadata is too small. Current buffer size: {TENSOR_META_SIZE} but required {len(meta_buf_list)}"
+            meta_buffer[:len(meta_buf_list)].copy_(torch.tensor(meta_buf_list, dtype=torch.int32))
+            p2p.send(meta_buffer, recv_stage)
+
+        else:
+            raise NotImplementedError(f'Could not send meta type {type(buffer1)}')
+
+        # Useful for performance debugging.
+        '''
+        if self.grid.data_parallel_id == 0:
+            print(f'STAGE={self.stage_id} pipe-send-volume: {send_bytes/1024**2:0.2f}MB')
+        '''
+
+    def _recv_tensor_meta_double(self, send_stage):
+        """Receive metadata about upcoming p2p transfers and return allocated buffers.
+
+        Returns:
+            Allocated buffer for receiving from send_stage.
+        """
+        buffer = torch.empty(TENSOR_META_SIZE, dtype=torch.int32, device=self.device)
+        p2p.recv(buffer, send_stage)
+
+##  start of buffer1, that is original info of student model
+        recv_type = buffer[0].item()
+
+        # # A single tensor will be sent.
+        # if recv_type == 0:
+        #     recv_dtype = self.ID_TO_DTYPE[buffer[1].item()]
+        #     recv_ndims = buffer[2].item()
+        #     recv_shape = buffer[3:3 + recv_ndims].tolist()
+        #     return self._allocate_or_extend_buffers(0, recv_shape, recv_dtype)
+
+        # List or tuple of tensors (recv_type == 1 (list) is currently unused)
+        if recv_type == 1 or recv_type == 2:
+            num_tensors1 = buffer[1].item()  #only meaningful for buffer1, not buffer2
+
+            buffers1 = []
+            offset = 2
+            #datatype, ndims, shape[...],
+            for idx in range(num_tensors1):
+                recv_dtype = self.ID_TO_DTYPE[buffer[offset].item()]
+                recv_ndims = buffer[offset + 1].item()
+                recv_shape = buffer[offset + 2:offset + 2 + recv_ndims].tolist()
+                offset += 2 + recv_ndims
+
+                buffers1.append(self._allocate_or_extend_buffers(idx, recv_shape, recv_dtype))
+
+            # Convert to tuples if requested.
+            if recv_type == 2:
+                buffers1 = tuple(buffers1)
+##  end of buffer1, that is original info of student model
+#######################################################################
+##  start of buffer2, that is original info of student model
+                recv_type = buffer[offset].item()
+                offset += 1
+                if recv_type == 1 or recv_type == 2:
+                    num_tensors2 = buffer[offset].item()  # only meaningful for buffer1, not buffer2
+                    offset += 1
+
+                    buffers2 = []
+                    # datatype, ndims, shape[...],
+                    for idx in range(num_tensors2):
+                        recv_dtype = self.ID_TO_DTYPE[buffer[offset].item()]
+                        recv_ndims = buffer[offset + 1].item()
+                        recv_shape = buffer[offset + 2:offset + 2 + recv_ndims].tolist()
+                        offset += 2 + recv_ndims
+
+                        buffers2.append(self._allocate_or_extend_ref_buffers(idx, recv_shape, recv_dtype))
+
+                    # Convert to tuples if requested.
+                    if recv_type == 2:
+                        buffers2 = tuple(buffers2)
+            ##  end of buffer1, that is original info of student model
+
+            return buffers1, buffers2
+
+        else:
+            raise NotImplementedError(f'Could not receive type {type(recv_type)}')
+
+    def _allocate_or_extend_ref_buffers(self, idx, shape, dtype):
+        numel = reduce(mul, shape) if len(shape) > 0 else 1
+        if len(self._grad_layer_buf_ref_model) <= idx or self._grad_layer_buf_ref_model[idx].numel() < numel:
+            new_buf = self._allocate_buffer(shape, dtype=dtype, num_buffers=1)[0]
+            if len(self._grad_layer_buf_ref_model) <= idx:
+                self._grad_layer_buf_ref_model.append(new_buf)
+            else:
+                self._grad_layer_buf_ref_model[idx] = None
+                self._grad_layer_buf_ref_model[idx] = new_buf
+            return self._grad_layer_buf_ref_model[idx]
+        else:
+            return self._grad_layer_buf_ref_model[idx].flatten()[:numel].view(shape)
+
+
+
 
     def _exec_optimizer_step(self, lr_kwargs=None):
         if self.wall_clock_breakdown():
@@ -722,6 +877,7 @@ class PipelineSFTRefModelEngine(PipelineEngine):
         # Free up the memory from the output of forward()
         self.pipe_buffers['output_tensors'][buffer_id] = None
         self.pipe_buffers['outputs'][buffer_id] = None
+        self.pipe_buffers['outputs_ref'][buffer_id] = None
         grad_tensors = None
 
         if self.wall_clock_breakdown():

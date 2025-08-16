@@ -3,19 +3,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
+
+#this version addes implementation of ref_model for sft
+
 import argparse
 import math
 import time
 import os
+import copy
 import shutil
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from dschat.utils.data.distill_data_utils import create_student_teacher_dataset
 # from torch.utils.data.distributed import DistributedSampler
 from transformers.trainer_utils import seed_worker
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 # from dschat.utils.ds_utils import get_train_ds_config
 from transformers import (
     AutoModelForCausalLM,
+    AutoTokenizer,
     SchedulerType,
     default_data_collator,
     get_scheduler,
@@ -34,7 +40,20 @@ from dschat.utils.module.lora import convert_linear_layer_to_lora, convert_lora_
 from dschat.utils.model.model_utils import create_hf_model, causal_lm_model_to_fp32_loss
 # from dschat.utils.perf import print_throughput
 # from pipelayers import PreEmbeddingPipeLayer, DecoderPipeLayer, NormPipeLayer, LMHeadPipeLayer, LossPipeLayer
-from pipelayers import get_model,get_model_loss_fn, DataCollatorForPromptDataset,DataCollatorForPromptDatasetDummy, print_mem, loss_fn_parent_no_ref
+from pipelayers import (get_model,get_model_loss_fn,
+                        get_model_loss_fn_distill,
+                        DataCollatorForPromptDataset,
+                        DataCollatorForPromptDatasetDummy, print_mem,
+                        loss_fn_parent,
+                        loss_fn_parent_no_ref,
+                        loss_fn_parent_distill,
+                        loss_fn_parent_distill_vanilla
+                        )
+
+from datasets import load_dataset, load_from_disk
+from ReferModel import PipelineSFTRefModelEngine, PipelineDistillModelEngine
+from transformers import AutoConfig
+from all_modules import DistillPipelineModule
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -43,7 +62,8 @@ def parse_args():
     parser.add_argument('--data_path',
                         nargs='*',
                         # default=['Dahoas/rm-static'],
-                        default = ['lukedai/test'],
+                        # default = ['lukedai/test'],
+                        default = ["mlabonne/FineTome-100k"],
                         # default = ['open-r1/OpenR1-Math-220k'],
                         help='Path to the training dataset. Accepted format:'
                         '1) a single data path, 2) multiple datasets in the'
@@ -79,31 +99,42 @@ def parse_args():
         help="DataLoader process numer, for both train and eval",
     )
     parser.add_argument(
-        "--model_name_or_path",
+        "--student_model_name_or_path",
         type=str,
-        default="Qwen/Qwen2.5-3B-Instruct",
+        default="Qwen/Qwen2-1.5B",
         help=
         "Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
     )
+
+    parser.add_argument(
+        "--teacher_model_name_or_path",
+        type=str,
+        default="/ssd2/model_arcee-ai_Arcee-Spark",
+        help=
+        "Path to pretrained model or model identifier from huggingface.co/models.",
+        required=False,
+    )
+
+
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=4,
+        default=8,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=4,
+        default=8,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
         "--max_seq_len",
         type=int,
         # default=512,
-        #default=16384,
-        default=4096,
+        # default=16384,
+        default=2048,
         help="The maximum sequence length.",
     )
     parser.add_argument(
@@ -259,6 +290,10 @@ def parse_args():
                         default=True,
                         help='whether using loss_fn for last stage.')
 
+    parser.add_argument('--temperature',
+                        default=1.0,
+                        help='vllm parameter ')
+
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
     return args
@@ -285,17 +320,36 @@ def main():
     torch.distributed.barrier(device_ids=[args.global_rank])
     # torch.distributed.barrier()
     # load_hf_tokenizer will get the correct tokenizer and set padding tokens based on the model family
-    args.end_of_conversation_token = "<|endoftext|>"
-    additional_special_tokens = args.end_of_conversation_token if args.add_eot_token else None
-    tokenizer = load_hf_tokenizer(args.model_name_or_path,
-                                  fast_tokenizer=True,
-                                  add_special_tokens=additional_special_tokens)
+
+    #will not use that
+    #args.end_of_conversation_token = "<|endoftext|>"
+
+    # additional_special_tokens = args.end_of_conversation_token if args.add_eot_token else None
+    # teacher_tokenizer = load_hf_tokenizer(args.teacher_model_name_or_path,
+    #                               fast_tokenizer=True,
+    #                               # add_special_tokens=additional_special_tokens
+    #                               )
+    #
+    # student_tokenizer = load_hf_tokenizer(args.student_model_name_or_path,
+    #                                       fast_tokenizer=True,
+    #                                       # add_special_tokens=additional_special_tokens
+    #                                       )
+    # Load tokenizers
+    teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_name_or_path)
+    student_tokenizer = AutoTokenizer.from_pretrained(args.student_model_name_or_path)
+
     torch_dtype = (
         args.torch_dtype if args.torch_dtype in ["auto", None] else getattr(torch, args.torch_dtype)
     )
-    model = create_hf_model(AutoModelForCausalLM,
-                            args.model_name_or_path,
-                            tokenizer,
+
+    model_kwargs = {"torch_dtype": torch_dtype}
+    if args.flash_attention:
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+    # teacher_model = AutoModelForCausalLM.from_pretrained(args.teacher_model_name_or_path, **model_kwargs)
+
+    teacher_model = create_hf_model(AutoModelForCausalLM,
+                            args.teacher_model_name_or_path,
+                            teacher_tokenizer,
                             ds_config,
                             dropout=args.dropout,
                             resize_embedding=False,
@@ -304,52 +358,79 @@ def main():
                             use_liger_kernel=args.use_liger_kernel,
                             gradient_checkpointing = args.gradient_checkpointing)
 
+    # student_model = AutoModelForCausalLM.from_pretrained(args.student_model_name_or_path, **model_kwargs)
+    student_model = create_hf_model(AutoModelForCausalLM,
+                            args.student_model_name_or_path,
+                            student_tokenizer,
+                            ds_config,
+                            dropout=args.dropout,
+                            resize_embedding=False,
+                            attn_implementation = args.flash_attention,
+                            torch_dtype=torch_dtype,
+                            use_liger_kernel=args.use_liger_kernel,
+                            gradient_checkpointing = args.gradient_checkpointing)
 
+    # teacher_config = AutoConfig.from_pretrained(args.teacher_model_name_or_path)
+    # student_config = AutoConfig.from_pretrained(args.student_model_name_or_path)
 
-
-    if args.compute_fp32_loss:
-        print_rank_0(
-            f"Using model {model.__class__.__name__} with loss in fp32",
-            args.global_rank)
-        causal_lm_model_to_fp32_loss(model)
-
-    if args.lora_dim > 0:
-        model = convert_linear_layer_to_lora(model, args.lora_module_name,
-                                             args.lora_dim,lora_scaling=args.lora_alpha, lora_droppout=args.lora_dropout)
-        if args.only_optimize_lora:
-            model = only_optimize_lora_parameters(model)
-            model = make_model_gradient_checkpointing_compatible(model)
+    #for save usage
+    student_config = AutoConfig.from_pretrained(args.student_model_name_or_path)
+    teacher_config = AutoConfig.from_pretrained(args.teacher_model_name_or_path)
+    # if args.compute_fp32_loss:
+    #     print_rank_0(
+    #         f"Using model {model.__class__.__name__} with loss in fp32",
+    #         args.global_rank)
+    #     causal_lm_model_to_fp32_loss(model)
+    #
+    # if args.lora_dim > 0:
+    #     model = convert_linear_layer_to_lora(model, args.lora_module_name,
+    #                                          args.lora_dim,lora_scaling=args.lora_alpha, lora_droppout=args.lora_dropout)
+    #     if args.only_optimize_lora:
+    #         model = only_optimize_lora_parameters(model)
+    #         model = make_model_gradient_checkpointing_compatible(model)
 
     # Prepare the data
     train_phase = 1
+    # if args.global_rank == 0:
 
-    train_dataset, eval_dataset = create_prompt_dataset_0(
-        args.is_eval,
-        args.local_rank,
-        args.data_path,
-        args.data_split,
-        args.data_output_path,
-        train_phase,
-        args.seed,
-        tokenizer,
-        args.max_seq_len,
-        end_of_conversation_token=tokenizer.eos_token,
-        sft_only_data_path=args.sft_only_data_path)
+    # Load tokenizers
+    # teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_name_or_path)
+    # student_tokenizer = AutoTokenizer.from_pretrained(args.student_model_name_or_path)
+    test = 1
 
-
-
+    train_dataset = create_student_teacher_dataset(
+        local_rank = args.local_rank,
+        data_path=args.data_path,
+        data_output_path=args.data_output_path,
+        seed=args.seed,
+        teacher_tokenizer = teacher_tokenizer,
+        student_tokenizer = student_tokenizer,
+        max_seq_len = args.max_seq_len
+        )
     torch.distributed.barrier(device_ids=[args.global_rank])
 
+
+    #will determine student and teacher's input_ids alignment issue
+    #but since in first version, they are of the same, so just
+    #remove teacher_inputs, teacher_attention_mask
+    train_dataset = train_dataset.remove_columns(['teacher_input_ids', 'teacher_attention_mask'])
+
+    #datacollator in dataloader will not recognize student_input_ids and student_attention_mask
+    #will change them to input_ids, attention_mask
+    train_dataset = train_dataset.rename_columns({'student_input_ids':'input_ids','student_attention_mask':'attention_mask'})
+
     #data sampler
-    train_sampler = RandomSampler(train_dataset)
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)  #manully set seed, otherwise would be totally randomly
+    train_sampler = RandomSampler(train_dataset, generator=generator)
 
     #data collator
     # data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     # data_collator = DataCollatorWithPadding(tokenizer)
     if args.custom_loss_fn:
-        data_collator = DataCollatorForPromptDatasetDummy(tokenizer, args.max_seq_len)
+        data_collator = DataCollatorForPromptDatasetDummy(student_tokenizer, args.max_seq_len)
     else:
-        data_collator = DataCollatorForPromptDataset(tokenizer, args.max_seq_len)
+        data_collator = DataCollatorForPromptDataset(student_tokenizer, args.max_seq_len)
     #data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, truncation=True)
 
     dataloader_params = {
@@ -372,18 +453,51 @@ def main():
     # print(model)
     #loss = loss_fn(outputs, label)
     if args.custom_loss_fn:
-        model_pipe = PipelineModule(layers=get_model_loss_fn(model),
+        # #make model fp16, so can copy embed weight to lm_head, orignal is bf16 in model
+        # dtype_config = ds_config['fp16']
+        # if dtype_config['enabled']:
+        #     teacher_model.half()
+        #     student_model.half()
+        # #end of convert dtype to fp16
+
+        # #creat a independent copy of embedding layer, for ref model use only, isolated from model itself
+        # #it is for loss_fn, since it need both train and ref model lm_head, which are different
+        # embed_tokens_ref_model = copy.deepcopy(teacher_model.lm_head)
+        # embed_tokens_ref_model = embed_tokens_ref_model.to(device)
+        # parameter_names = [n for n, _ in embed_tokens_ref_model.named_parameters()]
+        # for param_name in parameter_names:
+        #     param = embed_tokens_ref_model.get_parameter(param_name)
+        #     param.requires_grad = False
+
+        model_pipe = DistillPipelineModule(
+                                    teacher_layers=get_model_loss_fn_distill(
+                                        model = teacher_model,
+                                        role = "teacher",
+                                        # is_tied_embedding = teacher_config.tie_word_embeddings
+                                    ),
+
+                                    student_layers=get_model_loss_fn_distill(
+                                        model = student_model,
+                                        role = "student",
+                                        is_tied_embedding = student_config.tie_word_embeddings
+                                    ),
                                     num_stages=args.num_stages,
                                     # activation_checkpoint_interval = 4
-                                    loss_fn=loss_fn_parent_no_ref(model)
-                                    )
-    else:
-        model_pipe = PipelineModule(layers=get_model(model),
-                                    num_stages=args.num_stages,
-                                    # activation_checkpoint_interval = 4
+                                    #here we use embed since we assume student model is tied weight
+                                    loss_fn = loss_fn_parent_distill_vanilla(student_model.lm_head,
+                                                                             teacher_model.lm_head,
+                                                                             args.temperature,
+                                                                             args.max_seq_len)
                                     )
     #here, part of layers has already been moved to cuda:x, others left in cpu, in each process
     # model_pipe.to(device).half()
+
+    #since we ommit teacher lm_head in dummy layer(last layer), original layer is still in cpu
+    #so we need to move it to gpu, only for last stage. to reduce GPU memory occupy
+    if args.global_rank == args.num_stages-1:
+        teacher_model.lm_head.to(device)
+
+    #end of teacher lm head moving to device, maybe has no effect
 
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps)
@@ -408,13 +522,33 @@ def main():
     )
     ################################################################################################
 
+#config for reference model
+    #pipeline here is a switch, to open using sft refer model
+    pipeline_sft_refmodel_config = {'pipeline_sft_refer_model':True,
+                                    'engine': PipelineDistillModelEngine,
+                                    }
+
     #pipeline
     engine, _, _, _ = deepspeed.initialize(model=model_pipe,
                                            optimizer=optimizer,
                                            config=ds_config,
                                            model_parameters=model_pipe.parameters(),
                                            lr_scheduler = lr_scheduler,
+                                           sft_refmodel_config = pipeline_sft_refmodel_config
                                            )
+
+    # engine.module.forward_funcs_ref[0].parameters()
+
+#as original model parameter is bf16, and in deepspeed.initialize(),
+#forward_funcs has been altered , so forward_funcs_ref needs to do the same
+    # dtype_config = ds_config['fp16']
+    # model_ref = engine.module.forward_funcs_ref
+    # if dtype_config['enabled']:
+    #     for layer in model_ref:
+    #         layer.half()
+
+    #in deepspeed.initialize(), model parameter maybe converted to other types
+    #need to make forward_funcs_ref the same with original
 
     train_dataloader = iter(deepspeed.utils.RepeatingLoader(train_dataloader))
     # train_dataloader = iter(train_dataloader)
@@ -426,7 +560,11 @@ def main():
     #clear cache of cuda
     # torch.cuda.empty_cache()
 
+
+
+
     for step in range(args.num_train_epochs * num_update_steps_per_epoch-1):  #-1 is importtant , abandon last residual to avoid error
+    # for step in range(1):  # -1 is importtant , abandon last residual to avoid error
         torch.cuda.empty_cache()
         start1 = time.time()
         print_rank_0(
@@ -459,13 +597,18 @@ def main():
             print(f"Saving at step {step}")
             engine.save_checkpoint(args.output_dir)
 
-
             if args.global_rank == 0 and engine.global_steps <= args.save_model_step:
-                tokenizer.save_vocabulary(args.output_dir)
-                CONFIG_NAME = "config.json"
-                output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-                model.config.to_json_file(output_config_file)
+                # # tokenizer.save_vocabulary(args.output_dir)
+                # tokenizer.save_pretrained(args.output_dir)
+                # CONFIG_NAME = "config.json"
+                # output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+                # model.config.to_json_file(output_config_file)
+                # tokenizer.save_vocabulary(args.output_dir)
+                student_tokenizer.save_pretrained(args.output_dir)
 
+                student_config.save_pretrained(args.output_dir)
+
+                student_model.generation_config.save_pretrained(args.output_dir)
 
     if args.output_dir is not None:
         print_rank_0('saving the final model ...', args.global_rank)
@@ -475,11 +618,32 @@ def main():
     print(f"finished saving model")
 
     if args.global_rank == 0:
-        tokenizer.save_vocabulary(args.output_dir)
-        CONFIG_NAME = "config.json"
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-        model.config.to_json_file(output_config_file)
+        student_tokenizer.save_pretrained(args.output_dir)
+
+        # generate config.json
+        # current model
+        # CONFIG_NAME = "config_training_model.json"
+        # output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+        # model.config.to_json_file(output_config_file)
+
+        # base model
+
+        student_config.save_pretrained(args.output_dir)
+
+        # generation_config.json
+        # GENERATE_CONFIG_NAME = "generation_config_training_model.json"
+        # output_config_file = os.path.join(args.output_dir, GENERATE_CONFIG_NAME)
+        student_model.generation_config.save_pretrained(args.output_dir)
+
+        # # base model  been proved no difference with trained model
+        # GENERATE_CONFIG_NAME = "generation_config_base_model"
+        # output_config_file = os.path.join(args.output_dir, GENERATE_CONFIG_NAME)
+        # model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
+        # model.generation_config.save_pretrained(output_config_file)
+
         print(f"finished save vocabulary config and model config")
+
+
     torch.distributed.barrier(device_ids=[args.global_rank])
     print(f"done after sync, will exit programm ")
 

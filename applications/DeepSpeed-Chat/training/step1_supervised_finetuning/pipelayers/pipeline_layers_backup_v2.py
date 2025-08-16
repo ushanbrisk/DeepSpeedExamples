@@ -2,8 +2,10 @@
 this code is to split qwen2.5b-1.5-instruct to multiple classes, for parallel processing
 '''
 import torch
+import time
 from deepspeed.runtime.pipe import TiedLayerSpec, LayerSpec
 from training.step1_supervised_finetuning.ligerloss import LigerFusedLinearCrossEntropyLoss
+from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss as OriginalLigerFusedLinearCrossEntropyLoss
 
 from transformers import Qwen2ForCausalLM, Qwen2Model
 import torch.nn as nn
@@ -12,7 +14,7 @@ from torch.utils.checkpoint import checkpoint
 # from inference.huggingface.zero_inference.utils import hidden_bytes
 from training.step1_supervised_finetuning.grpo import hash_tensor
 from trl.trainer.utils import selective_log_softmax
-
+import torch.nn.functional as F
 '''
 1st layer, input: input_ids,
 output:hidden_states, position_ids, 
@@ -27,7 +29,7 @@ class PreEmbeddingPipeLayer(torch.nn.Module):
         # print(f"PreEmbedding: dtype {self.weight.data.dtype}")
 
     def forward(self,  ipt):
-        print(f"Embedding:{hash_tensor(self.weight.data)}")
+        # print(f"Embedding:{hash_tensor(self.weight.data)}")
 
         input_ids, labels = ipt
         inputs_embeds = self.embed_tokens(input_ids) #[bz, seq_len] -> [bz, seq_len, hidden_v]
@@ -45,6 +47,8 @@ class PreEmbeddingPipeLayer(torch.nn.Module):
         cos, sin = position_embeddings
         requires_grad_idx = torch.tensor([3]).to(hidden_states.device)  #here 3 different from [3], 3 may cause error in communication
         # print(f"pid: {os.getpid()},  PreEmbedding forward() called")
+
+
         return requires_grad_idx, cos, sin, hidden_states, position_ids, cache_position, labels
 
 class DecoderPipeLayer(torch.nn.Module):
@@ -152,6 +156,35 @@ def get_model_loss_fn(model):
               ]
     return layers
 
+def get_model_loss_fn_distill(model, role=None, is_tied_embedding=True):
+    key = "embed"
+    if role:
+        key = f"embed_{role}"
+
+    if role=="student" and is_tied_embedding:
+        layers = [TiedLayerSpec(key=key, typename = PreEmbeddingPipeLayer, model=model),
+                  *[LayerSpec(DecoderPipeLayer, model=model, layer_idx=idx) for idx in
+                    range(model.config.num_hidden_layers)],
+                  LayerSpec(NormPipeLayer, model=model),
+                  TiedLayerSpec(key=key, typename = LMHeadLossPipeLayerDummy, model=model),
+                  ]
+    elif role=="student" and not is_tied_embedding:
+        layers = [LayerSpec(PreEmbeddingPipeLayer, model=model),
+                  *[LayerSpec(DecoderPipeLayer, model=model, layer_idx=idx) for idx in
+                    range(model.config.num_hidden_layers)],
+                  LayerSpec(NormPipeLayer, model=model),
+                  LayerSpec(LMHeadLossNoTiedPipeLayerDummy, model=model),
+                  ]
+
+    elif role=="teacher": #no matter whether it is tied, split them
+        layers = [LayerSpec(PreEmbeddingPipeLayer, model=model),
+                  *[LayerSpec(DecoderPipeLayer, model=model, layer_idx=idx) for idx in
+                    range(model.config.num_hidden_layers)],
+                  LayerSpec(NormPipeLayer, model=model),
+                  LayerSpec(LMHeadLossNoTiedPipeLayerDummy, model=model),
+                  ]
+
+    return layers
 
 def get_model(model):
     layers = [TiedLayerSpec(key="embed",typename = PreEmbeddingPipeLayer, model=model),
@@ -243,6 +276,31 @@ class LMHeadLossPipeLayerDummy(torch.nn.Module):
 
             # return per_token_logps
 
+#since it has no relation with tied, we can ommit weight to reduce memory
+class LMHeadLossNoTiedPipeLayerDummyV1(torch.nn.Module):
+    def __init__(self, model:Qwen2ForCausalLM):
+        super().__init__()
+        # self.embed_tokens = model.model.embed_tokens
+        self.lm_head = model.lm_head
+        self.weight = self.lm_head.weight
+
+    def forward(self, ipt):
+        hidden_states, labels = ipt
+        return hidden_states
+
+#since it has no relation with tied, we can ommit weight to reduce memory
+class LMHeadLossNoTiedPipeLayerDummy(torch.nn.Module):
+    def __init__(self, model:Qwen2ForCausalLM):
+        super().__init__()
+        # self.embed_tokens = model.model.embed_tokens
+        #comment to reduce memory
+        # self.lm_head = model.lm_head
+        # self.weight = self.lm_head.weight
+
+    def forward(self, ipt):
+        hidden_states, labels = ipt
+        return hidden_states
+
 class LMHeadLossPipeLayer(torch.nn.Module):
     def __init__(self, model:Qwen2ForCausalLM):
         super().__init__()
@@ -320,7 +378,7 @@ def loss_fn_parent_no_ref(model):
         shift_labels = labels[..., 1:].contiguous()
         shift_hidden_states = shift_hidden_states.view(-1, shift_hidden_states.shape[-1])
         shift_labels = shift_labels.view(-1)
-        lce = LigerFusedLinearCrossEntropyLoss(reduction="mean")
+        lce = OriginalLigerFusedLinearCrossEntropyLoss(reduction="mean")
         loss = lce(weight, shift_hidden_states, shift_labels)
         return loss
 
@@ -371,3 +429,136 @@ def loss_fn_parent(model, ref_module):
         return loss
 
     return loss_fn
+
+#since during pipeline execution, last stage of hidden states of both model are passed
+#we need prepare lm_head of both models.
+
+def loss_fn_parent_distill(student_lm_head, teacher_lm_head):
+    weight = student_lm_head.weight
+    temperature = 1.0
+    def loss_fn(student_hidden, labels, teacher_hidden=None):
+        print(f"loss_fn,student hidden:{hash_tensor(student_hidden)}, "
+              f"teacher hidden:{hash_tensor(teacher_hidden)}, "
+              f"student lm_head weight:{hash_tensor(weight.data)}, "
+              f"teacher lm_head weight:{hash_tensor(teacher_lm_head.weight.data)}")
+
+        train_hidden_states = student_hidden
+        labels = labels
+        shift_hidden_states = train_hidden_states[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        teacher_hidden = teacher_hidden[..., :-1, :].contiguous()
+
+        all_logps = []
+        all_entropies = []
+        batch_size = 1
+        shift_hidden_states = shift_hidden_states.view(-1, shift_hidden_states.shape[-1])
+        shift_labels = shift_labels.view(-1)
+        teacher_hidden = teacher_hidden.view(-1, teacher_hidden.shape[-1])
+        lce = OriginalLigerFusedLinearCrossEntropyLoss(reduction="mean")
+        # loss = lce(weight, shift_hidden_states, shift_labels, teacher_hidden, teacher_lm_head.weight)
+        loss = lce(weight, shift_hidden_states, shift_labels)
+        return loss
+
+    return loss_fn
+
+
+
+
+def loss_fn_parent_distill_vanilla(student_lm_head, teacher_lm_head, temperature, max_len):
+    student_weight = student_lm_head.weight
+    teacher_weight = teacher_lm_head.weight
+
+
+    def loss_fn(student_hidden, labels, teacher_hidden=None):
+        # print(f"loss_fn,student hidden:{hash_tensor(student_hidden)}, "
+        #       f"teacher hidden:{hash_tensor(teacher_hidden)}, "
+        #       f"student lm_head weight:{hash_tensor(student_weight.data)}, "
+        #       f"teacher lm_head weight:{hash_tensor(teacher_weight.data)}")
+
+        shift_student_hidden = student_hidden[..., :-1, :].contiguous()
+        shift_teacher_hidden = teacher_hidden[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        # all_loss = Variable()
+        all_valid_length = 0
+
+        batch_size = 1
+
+        #no need
+        # shift_student_hidden = shift_student_hidden.view(-1, shift_student_hidden.shape[-1])
+        # shift_teacher_hidden = shift_teacher_hidden.view(-1, shift_teacher_hidden.shape[-1])
+        # shift_labels = shift_labels.view(-1)
+
+
+        for start in range(0, shift_student_hidden.size(0), batch_size):
+            shift_student_hidden_row = shift_student_hidden[start:start + batch_size]
+            shift_teacher_hidden_row = shift_teacher_hidden[start:start + batch_size]
+            shift_labels_row = shift_labels[start:start + batch_size]
+
+            #truncate padding token
+            valid_length =  (shift_labels_row!=-100).sum(dim=-1)
+            # print(f"loss fn, idx:{start}, valid_length:{valid_length}")
+            shift_student_hidden_row = shift_student_hidden_row[:,:valid_length,:]
+            shift_teacher_hidden_row = shift_teacher_hidden_row[:,:valid_length,:]
+
+            #get logits
+            shift_student_logit_row = student_lm_head(shift_student_hidden_row)
+            shift_teacher_logit_row = teacher_lm_head(shift_teacher_hidden_row)
+
+            #padding logits, to make vocabulary size the same ,is it necessary?
+            shift_student_logit_row, shift_teacher_logit_row = pad_logits(shift_student_logit_row, shift_teacher_logit_row)
+
+            shift_student_logit_row_scaled = shift_student_logit_row / temperature
+            shift_teacher_logit_row_scaled = shift_teacher_logit_row / temperature
+
+            # shift_student_logit_row_scaled = shift_student_logit_row_scaled.view(-1,
+            #                                     shift_student_logit_row_scaled.shape[-1]
+            #                                                                      )
+            # shift_student_logit_row_scaled = shift_student_logit_row_scaled.view(-1,
+            #                                     shift_student_logit_row_scaled.shape[-1]
+            #                                                                      )
+
+            loss_kd = F.kl_div(
+                F.log_softmax(shift_student_logit_row_scaled, dim=-1),
+                F.softmax(shift_teacher_logit_row_scaled, dim=-1),
+                reduction='batchmean'
+            ) * (temperature ** 2)  #why is is of square order with Temp?
+
+            if start == 0:
+                all_loss = loss_kd
+            else:
+                all_loss += loss_kd
+
+            all_valid_length += valid_length
+
+        final_loss = all_loss/(all_valid_length*1.0)
+
+        #
+        # lce = OriginalLigerFusedLinearCrossEntropyLoss(reduction="mean")
+        # # loss = lce(weight, shift_hidden_states, shift_labels, teacher_hidden, teacher_lm_head.weight)
+        # loss = lce(student_weight, shift_student_hidden, shift_labels)
+        #
+        #
+        #
+
+        return final_loss
+
+    return loss_fn
+
+
+
+
+
+
+
+
+def pad_logits(student_logits, teacher_logits):
+    student_size, teacher_size = student_logits.size(-1), teacher_logits.size(-1)
+    if student_size != teacher_size:
+        pad_size = abs(student_size - teacher_size)
+        pad_tensor = torch.zeros((*teacher_logits.shape[:-1], pad_size), dtype=teacher_logits.dtype,
+                                 device=teacher_logits.device)
+        return (torch.cat([student_logits, pad_tensor], dim=-1), teacher_logits) if student_size < teacher_size else (
+        student_logits, torch.cat([teacher_logits, pad_tensor], dim=-1))
+    return student_logits, teacher_logits

@@ -5,8 +5,8 @@ import torch
 from accelerate.utils import is_peft_model
 from deepspeed.runtime.pipe import TiedLayerSpec, LayerSpec
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-from grpo import hash_tensor
-
+# from grpo import hash_tensor
+from training.step1_supervised_finetuning.grpo import hash_tensor
 
 from training.step1_supervised_finetuning.grpo import get_reward_funcs, enable_gradient_checkpointing,check_module_requires_grad,PipelineGRPOEngine
 
@@ -68,6 +68,7 @@ class PreEmbeddingPipeLayer(torch.nn.Module):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         cos, sin = position_embeddings
         requires_grad_idx = torch.tensor([3]).to(hidden_states.device)  #here 3 different from [3], 3 may cause error in communication
+        print(f"PreEmbedding forward() called, weight:{hash_tensor(self.weight)}")
         # print(f"pid: {os.getpid()},  PreEmbedding forward() called, hidden_states")
         # return requires_grad_idx, cos, sin, hidden_states, causal_mask, torch.tensor([logits_to_keep]).to(hidden_states.device), prompt_completion_ids
         return hidden_states, causal_mask
@@ -139,15 +140,16 @@ class NormPipeLayer(torch.nn.Module):
         hidden_states = checkpoint(self.norm, hidden_states, use_reentrant = False)
         # print(f"pid: {os.getpid()},  NormLayer forward() called")
         return hidden_states, causal_mask
-#
+
+# #the problem is logit computation is consuming too large memory
 # class LMHeadPipeLayer(torch.nn.Module):
 #     def __init__(self, model:Qwen2ForCausalLM):
 #         super().__init__()
 #         if is_peft_model(model):
-#             self.embed_tokens = model.base_model.model.model.embed_tokens
+#             self.lm_head = model.base_model.model.lm_head
 #         else:
-#             self.embed_tokens = model.model.embed_tokens
-#         self.weight = self.embed_tokens.weight
+#             self.lm_head = model.model.lm_head
+#         self.weight = self.lm_head.weight
 #
 #     def forward(self, ipt):
 #         hidden_states, labels = ipt
@@ -187,13 +189,21 @@ def fixed_cross_entropy(source, target, num_items_in_batch: int = None, ignore_i
         loss = loss / num_items_in_batch
     return loss
 
-def get_model_loss_fn(model):
-    layers = [TiedLayerSpec(key="embed",typename = PreEmbeddingPipeLayer, model=model),
-              *[LayerSpec(DecoderPipeLayer, model=model, layer_idx=idx) for idx in
-                range(model.config.num_hidden_layers)],
-              LayerSpec(NormPipeLayer, model=model),
-              TiedLayerSpec(key="embed", typename = LMHeadLossPipeLayerDummy, model=model),
-              ]
+def get_model_loss_fn(model, is_tied_embedding=True):
+    if is_tied_embedding:
+        layers = [TiedLayerSpec(key="embed",typename = PreEmbeddingPipeLayer, model=model),
+                  *[LayerSpec(DecoderPipeLayer, model=model, layer_idx=idx) for idx in
+                    range(model.config.num_hidden_layers)],
+                  LayerSpec(NormPipeLayer, model=model),
+                  TiedLayerSpec(key="embed", typename = LMHeadLossPipeLayerDummy, model=model),
+                  ]
+    else:
+        layers = [LayerSpec(PreEmbeddingPipeLayer, model=model),
+                  *[LayerSpec(DecoderPipeLayer, model=model, layer_idx=idx) for idx in
+                    range(model.config.num_hidden_layers)],
+                  LayerSpec(NormPipeLayer, model=model),
+                  LayerSpec(LMHeadLossNoTiedPipeLayerDummy, model=model),
+                  ]
     return layers
 
 def get_model_loss_fn_no_tied(model):
@@ -253,6 +263,23 @@ class LMHeadLossPipeLayerDummy(torch.nn.Module):
         # print(f"pid: {os.getpid()},  LMHeadLossPipeLayerDummy() called")
         return hidden_states, causal_mask
 
+class LMHeadLossNoTiedPipeLayerDummy(torch.nn.Module):
+    def __init__(self, model:Qwen2ForCausalLM):
+        super().__init__()
+        if is_peft_model(model):
+            self.lm_head = model.base_model.model.lm_head
+        else:
+            self.lm_head = model.lm_head
+        self.weight = self.lm_head.weight
+        # print(f"lossDummy memory: {id(self.embed_tokens.weight)}, pid:{os.getpid()}")
+
+    def forward(self, ipt):  #here may not need transmit these variables, reduce memory
+        hidden_states, causal_mask = ipt
+        # print(f"pid: {os.getpid()},  LMHeadLossPipeLayerDummy() called")
+        return hidden_states, causal_mask
+
+
+
 class LMHeadLossPipeLayer(torch.nn.Module):
     def __init__(self, model:Qwen2ForCausalLM):
         super().__init__()
@@ -282,6 +309,7 @@ def loss_fn_parent(model, temperature=1.0,
                    gradient_accumulation_steps=1,
                    epsilon_low = 0.0,
                    epsilon_high = 0.0):
+
     if is_peft_model(model):
         embed_tokens = model.base_model.model.model.embed_tokens
     else:
@@ -381,15 +409,25 @@ def loss_fn_parent_policy_gradient(model, temperature=1.0,
                    num_iterations=1,
                    gradient_accumulation_steps=1,
                    epsilon_low = 0.0,
-                   epsilon_high = 0.0):
-    if is_peft_model(model):
-        embed_tokens = model.base_model.model.model.embed_tokens
+                   epsilon_high = 0.0,
+                   is_tied = True):
+    if is_tied:
+        if is_peft_model(model):
+            embed_tokens = model.base_model.model.model.embed_tokens
+        else:
+            embed_tokens = model.model.embed_tokens
+        weight = embed_tokens.weight
     else:
-        embed_tokens = model.model.embed_tokens
-    weight = embed_tokens.weight
+        if is_peft_model(model):
+            embed_tokens = model.base_model.model.lm_head
+        else:
+            embed_tokens = model.lm_head
+        weight = embed_tokens.weight
+
     #here weight is tied with input embedding matrix, now is lm_head
 
     def loss_fn(outputs, labels, old_token_logps, global_pipeline_steps, step):
+        print(f"loss_fn of policy gradient lm_head weight:{hash_tensor(weight)}")
         # print(f"loss_fn memory: id{id(embed_tokens.weight)}, pid:{os.getpid()}")
         hidden_states, causal_mask = outputs
         prompt_completion_ids,logits_to_keep, advantages = labels
@@ -437,11 +475,21 @@ def loss_fn_parent_policy_gradient(model, temperature=1.0,
 
         per_token_logps =  selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
 
-        per_token_loss1 = per_token_logps * advantages.unsqueeze(1)
 
-        per_token_loss = -per_token_loss1
 
+        old_per_token_logps = per_token_logps.detach()
+        coef_1 = torch.exp(per_token_logps - old_per_token_logps)
+        coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
+        # for test :
+        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+
+        # #this is for no clamp version, no usage here
+        # per_token_loss1 = per_token_logps * advantages.unsqueeze(1)
+        # per_token_loss = -per_token_loss1
+        # loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
         print(f"pid: {os.getpid()},  loss_fn_parent_policy_gradient() called, loss: {loss}, advantange: {advantages}")
         return loss
@@ -450,13 +498,20 @@ def loss_fn_parent_policy_gradient(model, temperature=1.0,
 def loss_fn_parent_liger(model,
                    num_iterations=1,
                    gradient_accumulation_steps=1,
-                   liger_loss = None
-                   ):
-    if is_peft_model(model):
-        embed_tokens = model.base_model.model.model.embed_tokens
+                   liger_loss = None,
+                   is_tied = True):
+    if is_tied:
+        if is_peft_model(model):
+            embed_tokens = model.base_model.model.model.embed_tokens
+        else:
+            embed_tokens = model.model.embed_tokens
+        weight = embed_tokens.weight
     else:
-        embed_tokens = model.model.embed_tokens
-    weight = embed_tokens.weight
+        if is_peft_model(model):
+            embed_tokens = model.base_model.model.lm_head
+        else:
+            embed_tokens = model.lm_head
+        weight = embed_tokens.weight
     #here weight is tied with input embedding matrix, now is lm_head
     liger_grpo_loss = liger_loss
 
@@ -477,6 +532,7 @@ def loss_fn_parent_liger(model,
 
         print(f"valid_length:{valid_length}, hidden_states_shape:{hidden_states.shape}, causal_mask_shape:{causal_mask.shape}")
         print(f"loss_fn1 input hidden_states:{hash_tensor(hidden_states)}, causal_mask:{hash_tensor(causal_mask)}")
+        print(f"loss_fn lm_head weight:{hash_tensor(weight)}")
         #shrink
         hidden_states = hidden_states[:, :valid_length, :]
         causal_mask = causal_mask[:,:valid_length]
@@ -532,6 +588,7 @@ def loss_fn_parent_liger(model,
         # print(f"pid: {os.getpid()},  loss_fn_parent() called, loss: {loss}, advantange: {advantages}")
         return loss
     return loss_fn
+
 
 def loss_fn_grop_parent(model):
     if is_peft_model(model):
