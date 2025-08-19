@@ -122,9 +122,18 @@ def get_pipeline_ds_config(args):
                  # "bfloat16": {
                  #     "enabled": True
                  # },
+                 # "fp16": {
+                 #     "enabled": True,
+                 #     "loss_scale_window": 100},
+
                  "fp16": {
                      "enabled": True,
-                     "loss_scale_window": 100},
+                     "loss_scale": 0,
+                     "loss_scale_window": 1000,
+                     "initial_scale_power": 14,
+                     "hysteresis": 1,
+                     },
+
                  # "scheduler": {
                  #     "type": "WarmupCosineLR",
                  #     "params": {
