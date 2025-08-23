@@ -4,7 +4,7 @@ this code is to split qwen2.5b-1.5-instruct to multiple classes, for parallel pr
 import torch
 import time
 from deepspeed.runtime.pipe import TiedLayerSpec, LayerSpec
-from training.step1_supervised_finetuning.ligerloss import LigerFusedLinearCrossEntropyLoss
+from training.step1_supervised_finetuning.ligerloss import LigerFusedLinearCrossEntropyLoss,LigerFusedLinearCrossEntropyKLDivLoss
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss as OriginalLigerFusedLinearCrossEntropyLoss
 
 from transformers import Qwen2ForCausalLM, Qwen2Model
@@ -547,11 +547,100 @@ def loss_fn_parent_distill_vanilla(student_lm_head, teacher_lm_head, temperature
     return loss_fn
 
 
+def loss_fn_parent_distill_ligerkernel(student_lm_head, teacher_lm_head, temperature, max_len):
+    student_weight = student_lm_head.weight
+    teacher_weight = teacher_lm_head.weight
+
+
+    def loss_fn(student_hidden, labels, teacher_hidden=None):
+        # print(f"loss_fn,student hidden:{hash_tensor(student_hidden)}, "
+        #       f"teacher hidden:{hash_tensor(teacher_hidden)}, "
+        #       f"student lm_head weight:{hash_tensor(student_weight.data)}, "
+        #       f"teacher lm_head weight:{hash_tensor(teacher_weight.data)}")
+
+        shift_student_hidden = student_hidden[..., :-1, :].contiguous()
+        shift_teacher_hidden = teacher_hidden[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        # all_loss = Variable()
+        all_valid_length = 0
+
+        batch_size = 1
+
+        #no need
+        # shift_student_hidden = shift_student_hidden.view(-1, shift_student_hidden.shape[-1])
+        # shift_teacher_hidden = shift_teacher_hidden.view(-1, shift_teacher_hidden.shape[-1])
+        # shift_labels = shift_labels.view(-1)
+
+
+        # for start in range(0, shift_student_hidden.size(0), batch_size):
+        #     shift_student_hidden_row = shift_student_hidden[start:start + batch_size]
+        #     shift_teacher_hidden_row = shift_teacher_hidden[start:start + batch_size]
+        #     shift_labels_row = shift_labels[start:start + batch_size]
+        #
+        #     #truncate padding token
+        #     valid_length =  (shift_labels_row!=-100).sum(dim=-1)
+        #     # print(f"loss fn, idx:{start}, valid_length:{valid_length}")
+        #     shift_student_hidden_row = shift_student_hidden_row[:,:valid_length,:]
+        #     shift_teacher_hidden_row = shift_teacher_hidden_row[:,:valid_length,:]
+        #
+        #     #get logits
+        #     shift_student_logit_row = student_lm_head(shift_student_hidden_row)
+        #     shift_teacher_logit_row = teacher_lm_head(shift_teacher_hidden_row)
+        #
+        #     #padding logits, to make vocabulary size the same ,is it necessary?
+        #     shift_student_logit_row, shift_teacher_logit_row = pad_logits(shift_student_logit_row, shift_teacher_logit_row)
+        #
+        #     shift_student_logit_row_scaled = shift_student_logit_row / temperature
+        #     shift_teacher_logit_row_scaled = shift_teacher_logit_row / temperature
+        #
+        #     # shift_student_logit_row_scaled = shift_student_logit_row_scaled.view(-1,
+        #     #                                     shift_student_logit_row_scaled.shape[-1]
+        #     #                                                                      )
+        #     # shift_student_logit_row_scaled = shift_student_logit_row_scaled.view(-1,
+        #     #                                     shift_student_logit_row_scaled.shape[-1]
+        #     #                                                                      )
+        #
+        #     loss_kd = F.kl_div(
+        #         F.log_softmax(shift_student_logit_row_scaled, dim=-1),
+        #         F.softmax(shift_teacher_logit_row_scaled, dim=-1),
+        #         reduction='batchmean'
+        #     ) * (temperature ** 2)  #why is is of square order with Temp?
+        #
+        #     if start == 0:
+        #         all_loss = loss_kd
+        #     else:
+        #         all_loss += loss_kd
+        #
+        #     all_valid_length += valid_length
+        #
+        # final_loss = all_loss/(all_valid_length*1.0)
+
+        lce = LigerFusedLinearCrossEntropyKLDivLoss(alpha=0.5, reduction="mean")
 
 
 
 
+        # loss = lce(weight, shift_hidden_states, shift_labels, teacher_hidden, teacher_lm_head.weight)
 
+        #
+        # lce = OriginalLigerFusedLinearCrossEntropyLoss(reduction="mean")
+        # # loss = lce(weight, shift_hidden_states, shift_labels, teacher_hidden, teacher_lm_head.weight)
+        # loss = lce(student_weight, shift_student_hidden, shift_labels)
+        #
+        #
+        #
+        lce = LigerFusedLinearCrossEntropyKLDivLoss(alpha=0.0, reduction="mean")
+
+        shift_student_hidden = shift_student_hidden.view(-1, shift_student_hidden.shape[-1])
+        shift_labels = shift_labels.view(-1)
+        shift_teacher_hidden = shift_teacher_hidden.view(-1, shift_teacher_hidden.shape[-1])
+
+        loss = lce(student_weight, shift_student_hidden, shift_labels, shift_teacher_hidden, teacher_weight)
+
+        return loss
+
+    return loss_fn
 
 def pad_logits(student_logits, teacher_logits):
     student_size, teacher_size = student_logits.size(-1), teacher_logits.size(-1)

@@ -42,12 +42,14 @@ from dschat.utils.model.model_utils import create_hf_model, causal_lm_model_to_f
 # from pipelayers import PreEmbeddingPipeLayer, DecoderPipeLayer, NormPipeLayer, LMHeadPipeLayer, LossPipeLayer
 from pipelayers import (get_model,get_model_loss_fn,
                         get_model_loss_fn_distill,
+
                         DataCollatorForPromptDataset,
                         DataCollatorForPromptDatasetDummy, print_mem,
                         loss_fn_parent,
                         loss_fn_parent_no_ref,
                         loss_fn_parent_distill,
-                        loss_fn_parent_distill_vanilla
+                        loss_fn_parent_distill_vanilla,
+                        loss_fn_parent_distill_ligerkernel
                         )
 
 from datasets import load_dataset, load_from_disk
@@ -120,13 +122,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=8,
+        default=24,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=8,
+        default=24,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -155,7 +157,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=4,
+        default=6,
         help=
         "Number of updates steps to accumulate before performing a backward/update pass.",
     )
@@ -484,7 +486,7 @@ def main():
                                     num_stages=args.num_stages,
                                     # activation_checkpoint_interval = 4
                                     #here we use embed since we assume student model is tied weight
-                                    loss_fn = loss_fn_parent_distill_vanilla(student_model.lm_head,
+                                    loss_fn = loss_fn_parent_distill_ligerkernel(student_model.lm_head,
                                                                              teacher_model.lm_head,
                                                                              args.temperature,
                                                                              args.max_seq_len)

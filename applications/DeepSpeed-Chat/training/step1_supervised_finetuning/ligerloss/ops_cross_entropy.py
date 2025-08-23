@@ -529,3 +529,335 @@ MAX_FUSED_SIZE = 4096 if infer_device() == "xpu" else 65536 // 2  # the best siz
 #             None,
 #             None,
 #         )
+
+
+@triton.jit
+def liger_cross_entropy_kldiv_kernel(
+        X_ptr,
+        X_stride,
+        Y_ptr,
+        Y_stride,
+        ref_X1_ptr,  # added by luke
+        ref_X1_stride,  # added by luke
+        alpha,  # added by luke
+        weight_ptr,
+        loss_ptr,
+        z_loss_ptr,
+        loss_stride,
+        n_cols,
+        n_non_ignore,
+        sum_non_ignore_weight,
+        weight_sum,
+        ignore_index,
+        lse_square_scale: tl.constexpr,
+        label_smoothing: tl.constexpr,
+        reduction: tl.constexpr,  # set it as constexpr since reduction is always known at compile time
+        softcap,
+        RETURN_Z_LOSS: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+        HAS_WEIGHT: tl.constexpr,
+        HAS_SOFTCAPPING: tl.constexpr,
+):
+    """
+    This kernel computes both cross entropy loss and the gradient of the input.
+    We only consider hard label + mean reduction for now. Please refer to https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html for the math.
+
+    Parameters:
+    X_ptr: Pointer to input tensor.
+    X_stride (int): The stride of the input tensor.
+    Y_ptr: Pointer to target tensor.
+    Y_stride (int): The stride of the target tensor.
+    ref_X1_ptr, # pointer to ref logits, added by luke
+    ref_X1_stride, #the stride of the ref logits, added by luke
+
+    weight_ptr: Pointer to weight tensor.
+    loss_ptr: Pointer to tensor to store the loss.
+    z_loss_ptr: Pointer to tensor to store the z loss. No operation if RETURN_Z_LOSS is 0.
+    loss_stride (int): The stride of the loss tensor.
+    n_cols (int): The number of columns in the input tensor.
+    n_non_ignore (float): The number of non-ignored elements in the batch.
+    sum_non_ignore_weight (float): The sum of non-ignored target's weights in the batch.
+    weight_sum (float): The sum of weight tensor.
+    ignore_index (int): The index to ignore in the target.
+    label_smoothing (float): The amount of smoothing when computing the loss, where 0.0 means no smoothing.
+    lse_square_scale (float): The scaler of (logsumexp(_input)) ^ 2 adding to the loss for the stability of training.
+    reduction (str): The string for the reduction to apply
+    softcap (float): The upper threshold for scaling logits to the range (-softcap, +softcap).
+    RETURN_Z_LOSS (int): The boolean value to decide whether storing z loss to z_loss_ptr or not. It must be 0 or 1.
+    BLOCK_SIZE (int): The block size for Triton operations.
+    HAS_WEIGHT (bool): The boolean value to determine whether assigning weight to each of the classes.
+    HAS_SOFTCAPPING (bool): The boolean value to determine whether applying soft-capping or not.
+    """
+
+    # https://github.com/triton-lang/triton/issues/1058
+    # If B*T*V is too large, program_id * stride will overflow out of int32, so we convert to int64
+    program_id = tl.program_id(0).to(tl.int64)
+
+    # 1. Load Y_ptr first because if the target is ignore_index, we can return right away
+    Y_ptr += program_id * Y_stride
+    y = tl.load(Y_ptr)
+
+    # 2. locate the start index
+    X_ptr += program_id * X_stride
+
+    # 2.1 locate the start index of ref logits
+    ref_X1_ptr += program_id * ref_X1_stride
+
+    if y == ignore_index:
+        # set all X_ptr as 0
+        for i in range(0, n_cols, BLOCK_SIZE):
+            X_offsets = i + tl.arange(0, BLOCK_SIZE)
+            tl.store(X_ptr + X_offsets, 0.0, mask=X_offsets < n_cols)
+        return
+
+    loss_ptr += program_id * loss_stride
+    if RETURN_Z_LOSS:
+        z_loss_ptr += program_id * loss_stride
+
+    if HAS_WEIGHT:
+        weight_y = tl.load(weight_ptr + y).cast(tl.float32)
+
+    # Online softmax: 2 loads + 1 store (compared with 3 loads + 1 store for the safe softmax)
+    # Refer to Algorithm 3 in the paper: https://arxiv.org/pdf/1805.02867
+
+    # 3. [Online softmax] first pass: find max + sum
+    m = float("-inf")  # m is the max value. use the notation from the paper
+    d = 0.0  # d is the sum. use the notation from the paper
+    ori_X_y = tl.load(X_ptr + y).cast(tl.float32)  # we need to store the original value of X_y for the loss calculation
+    if HAS_SOFTCAPPING:
+        ori_X_y = softcap * tanh(ori_X_y / softcap)
+
+    # 3.1 [Online softmax] first pass: find max + sum for ref model
+    m_ref = float("-inf")
+    d_ref = 0.0
+    ori_X_y_ref = tl.load(ref_X1_ptr + y).cast(tl.float32)
+
+    # Label smoothing is a general case of normal cross entropy
+    # See the full derivation at https://github.com/linkedin/Liger-Kernel/pull/198#issue-2503665310
+    scaled_x_sum = 0.0
+    eps = label_smoothing / n_cols
+
+    for i in range(0, n_cols, BLOCK_SIZE):
+        X_offsets = i + tl.arange(0, BLOCK_SIZE)
+        X_block = tl.load(
+            X_ptr + X_offsets,
+            mask=X_offsets < n_cols,
+            other=float("-inf"),
+            # Ensure float32 precision for softmax calculation
+        ).cast(tl.float32)
+
+        ref_X1_block = tl.load(
+            ref_X1_ptr + X_offsets,
+            mask=X_offsets < n_cols,
+            other=float("-inf"),
+            # Ensure float32 precision for softmax calculation
+        ).cast(tl.float32)
+
+        if HAS_SOFTCAPPING:
+            X_block = softcap * tanh(X_block / softcap)
+            ref_X1_block = softcap * tanh(ref_X1_block / softcap)
+        block_max = tl.max(X_block)
+        ref_block_max = tl.max(ref_X1_block)
+        if label_smoothing > 0:
+            # scale X beforehand to avoid overflow
+            if HAS_WEIGHT:  # no ref model implemented
+                weight_block = tl.load(weight_ptr + X_offsets, mask=X_offsets < n_cols)
+                scaled_x_sum += tl.sum(tl.where(X_offsets < n_cols, -eps * X_block * weight_block, 0.0))
+            else:
+                scaled_x_sum += tl.sum(tl.where(X_offsets < n_cols, -eps * X_block, 0.0))
+        m_new = tl.maximum(m, block_max)
+        m_new_ref = tl.maximum(m_ref, ref_block_max)  # added by luke
+
+        d = d * tl.exp(m - m_new) + tl.sum(tl.exp(X_block - m_new))
+        m = m_new
+
+        d_ref = d_ref * tl.exp(m_ref - m_new_ref) + tl.sum(tl.exp(ref_X1_block - m_new_ref))
+        m_ref = m_new_ref
+
+
+
+    # log (sum(e^(X_i))) = log (sum(e ^ (max(X) * e ^ (X_i - max(X)))))
+    #                    = log (e^(max(X)) * sum(e ^ (X_i - max(X))))
+    #                    = max(X) + log (sum(e ^ (X_i - max(X)))) = m + log d
+    lse = m + tl.log(d)
+    lse_ref = m_ref + tl.log(d_ref)
+
+    # 4. [Online Softmax] Second pass: compute gradients
+    # For 'mean' reduction, gradients are normalized by number of non-ignored elements (N)
+    # dx_y = (softmax(x_y) - 1) / N
+    # dx_i = softmax(x_i) / N, i != y
+    # For label smoothing:
+    # dx_i = (softmax(x_i) - label_smoothing / V) / N, V = n_cols, i != y
+    # dx_y = (softmax(x_y) - label_smoothing / V - (1 - label_smoothing)) / N
+    #      = dx_i - (1 - label_smoothing) / N
+    # With Z loss:
+    # dx_i = ((1 + 2 * lse_square_scale * lse) * softmax(x_i) - label_smoothing / V) / N, i != y
+    # dx_y = dx_i - (1 - label_smoothing) / N
+    # For 'sum' reduction, no normalization is applied:
+    # dx_y = softmax(x_y) - 1
+    # dx_i = softmax(x_i), for i ≠ y
+
+####################################################### loss ####################
+    # 5. Calculate the loss
+    loss_kld = 0.0
+    loss_kld = loss_kld.cast(tl.float32)
+    # tl.device_print("n_cols", n_cols)
+    # tl.device_print("BLOCK_SIZE", BLOCK_SIZE)
+    test_soft = 0.0
+    test_diff = 0.0
+    for i in range(0, n_cols, BLOCK_SIZE):
+    # for i in range(0, BLOCK_SIZE, BLOCK_SIZE):
+        X_offsets = i + tl.arange(0, BLOCK_SIZE)
+        X_block = tl.load(
+            X_ptr + X_offsets,
+            mask=X_offsets < n_cols,
+            other=float("-inf"),
+            # Ensure float32 precision for softmax calculation
+        ).cast(tl.float32)
+
+        ref_X1_block = tl.load(
+            ref_X1_ptr + X_offsets,
+            mask=X_offsets < n_cols,
+            other=float("-inf"),
+            # Ensure float32 precision for softmax calculation
+        ).cast(tl.float32)
+
+        soft_ref_prob = tl.exp(ref_X1_block - m_ref) / d_ref
+
+        soft_prob = tl.exp(X_block - m) / d
+
+        log_prob_student = tl.log(tl.maximum(soft_prob, 1e-10))
+
+
+        log_prob_teacher = tl.log(tl.maximum(soft_ref_prob, 1e-10))
+
+
+        kl_v = soft_ref_prob * (log_prob_teacher - log_prob_student)
+
+        # log_ref = soft_ref_prob * (ref_X1_block - X_block)
+
+
+        # temp = tl.sum(diff)
+        # sum1 = tl.sum(kl_v)
+        # sum2 = tl.sum(tl.exp(ref_X1_block - m_ref))
+        # sum2 = tl.sum(X_block)
+        delta_sigma = tl.sum(kl_v)
+        # tl.device_print("sum1", sum1)
+
+        # tl.device_print("sum2", sum2)
+
+        loss_kld += delta_sigma
+
+        # tl.device_print("ref_X1_block", ref_X1_block)
+        #tl.device_print("d_ref", d_ref)
+        # tl.device_print("loss_kld", loss_kld)
+        # tl.device_print("delta_sigma", delta_sigma)
+        # tl.device_print("lse", lse)
+
+
+    # loss = log (softmax(X_y)) = log ((e ^ (X_y - max(X)) / sum(e ^ (X - max(X))))
+    #      = (X_y - max(X)) - log(sum(e ^ (X - max(X))))
+    #      = X_y - m - log d = X_y - lse
+    # sum(e ^ (X - max(X))) must >= 1 because the max term is e ^ 0 = 1
+    # So we can safely calculate log (softmax(X_y)) without overflow
+    crossentropy_loss = lse - ori_X_y
+    # tl.device_print("loss_kld 0 : ", loss_kld)
+    # loss_kld = loss_kld - (lse_ref - lse)
+    # if (odds - 0.0) > 0.0001 or (odds - 0.0) < -0.0001:
+    #     tl.device_print("odds:", odds) #for debug
+    # tl.device_print("loss_kld : ", loss_kld)
+    # tl.device_print("test soft max",test_soft)
+
+    loss = crossentropy_loss * (1.0-alpha) +  alpha * loss_kld
+
+    if HAS_WEIGHT:
+        loss = weight_y * loss
+
+    # Original loss = H(q, p),  with label smoothing regularization = H(q', p) and (label_smoothing / V) = eps
+    # H(q', p) = (1 - label_smoothing) * H(q, p) + label_smoothing * H(u, p)
+    #          = (1 - label_smoothing) * H(q, p) + eps * sum(logsoftmax(x_i))
+    # By using m (global max of xi) and d (sum of e^(xi-m)), we can simplify as:
+    #          = (1 - label_smoothing) * H(q, p) + (sum(-eps * x_i) + label_smoothing * (m + logd))
+    # Refer to H(q', p) in section 7 of the paper: https://arxiv.org/pdf/1512.00567
+    # pytorch: https://github.com/pytorch/pytorch/blob/2981534f54d49fa3a9755c9b0855e7929c2527f0/aten/src/ATen/native/LossNLL.cpp#L516
+    # See full derivation at https://github.com/linkedin/Liger-Kernel/pull/198#issuecomment-2333753087
+    if label_smoothing > 0:
+        if HAS_WEIGHT:
+            smooth_loss = scaled_x_sum + eps * lse * weight_sum
+        else:
+            smooth_loss = scaled_x_sum + label_smoothing * lse
+        loss = loss * (1 - label_smoothing) + smooth_loss
+
+    # An auxiliary loss, z_loss
+    # Refer to Page14 Loss function section in the paper PaLM: https://www.jmlr.org/papers/v24/22-1144.html
+    z_loss = lse_square_scale * lse * lse
+    # Normalize the loss by the number of non-ignored elements if reduction is "mean"
+    if reduction == "mean":
+        if HAS_WEIGHT:
+            loss = loss / sum_non_ignore_weight
+        else:
+            loss = loss / n_non_ignore
+        # TODO: Implement weighted z_loss. Currently, z_loss is not scaled by weight.
+        z_loss = z_loss / n_non_ignore
+    loss += z_loss
+
+    tl.store(loss_ptr, loss)
+    if RETURN_Z_LOSS:
+        tl.store(z_loss_ptr, z_loss)
+
+
+
+
+##########################################derivation#########################
+    # added by luke for derivation of loss
+    for i in range(0, n_cols, BLOCK_SIZE):
+        X_offsets = i + tl.arange(0, BLOCK_SIZE)
+        X_block = tl.load(
+            X_ptr + X_offsets,
+            mask=X_offsets < n_cols,
+            other=float("-inf"),
+            # Ensure float32 precision for softmax calculation
+        ).cast(tl.float32)
+
+        ref_X1_block = tl.load(
+            ref_X1_ptr + X_offsets,
+            mask=X_offsets < n_cols,
+            other=float("-inf"),
+            # Ensure float32 precision for softmax calculation
+        ).cast(tl.float32)
+
+        if HAS_SOFTCAPPING:
+            intermediate = tanh(X_block / softcap)
+            intermediate_ref = tanh(ref_X1_block / softcap)
+            X_block = softcap * intermediate
+            ref_X1_block = softcap * intermediate_ref
+
+
+        # softmax(x_i)
+        X_block = tl.exp(X_block - m) / d
+        ref_X1_block = tl.exp(ref_X1_block - m_ref) / d_ref
+
+        # smoothing term
+        X_block += -eps
+        # ref_X1_block += -eps
+        # special handle dx_y , but here is for derivatives
+        # X_block = tl.where(X_offsets != y, X_block, (X_block - (1 - label_smoothing)))
+        # we multiply kl coeff to the gradient, changed by luke 20250724
+        X_block = tl.where(X_offsets != y, (1-alpha)*X_block + alpha * (X_block - ref_X1_block),
+            (1-alpha)*(X_block - (1 - label_smoothing)) + alpha * (X_block - ref_X1_block))
+
+        if reduction == "mean":
+            X_block = X_block / n_non_ignore
+
+        # chain rule softcapping
+        # d(softcap * tanh(x / softcap)) = (1 - tanh^2(x / softcap))
+        if HAS_SOFTCAPPING:
+            X_block = X_block * (1 - intermediate * intermediate)
+
+        # here to store the derivatives
+        tl.store(X_ptr + X_offsets, X_block, mask=X_offsets < n_cols)
+
+    # We need tl.debug_barrier() to ensure the new result of X_ptr is written as mentioned in
+    # https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/ops/cross_entropy.py#L34
+    tl.debug_barrier()
+
