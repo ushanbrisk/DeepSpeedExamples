@@ -147,8 +147,9 @@ class DistillPipelineModule(PipelineModule):
             self.teacher_parts = partition_balanced(weights=param_counts, num_parts=num_stages)
 
         #for debug, manually set
-        self.teacher_parts = [0,2,3,6,10,19,31] # for distill 6 stages
 
+        self.teacher_parts = [0,2,3,6,10,19,31] # for distill 6 stages
+        # self.teacher_parts = [0, 6, 10, 14, 25, 29, 31]  # for distill 6 stages
 
         # Print some information on the partitioning.
         if self.global_rank == 0:

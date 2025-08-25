@@ -122,13 +122,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=24,
+        default=40,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=24,
+        default=40,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -136,7 +136,7 @@ def parse_args():
         type=int,
         # default=512,
         # default=16384,
-        default=2048,
+        default=1024,
         help="The maximum sequence length.",
     )
     parser.add_argument(
@@ -607,7 +607,7 @@ def main():
                 # model.config.to_json_file(output_config_file)
                 # tokenizer.save_vocabulary(args.output_dir)
                 student_tokenizer.save_pretrained(args.output_dir)
-
+                #datatype has been changed to float16, not bf16 anymore
                 student_config.save_pretrained(args.output_dir)
 
                 student_model.generation_config.save_pretrained(args.output_dir)

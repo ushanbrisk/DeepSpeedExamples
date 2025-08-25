@@ -700,7 +700,7 @@ def liger_cross_entropy_kldiv_kernel(
 ####################################################### loss ####################
     # 5. Calculate the loss
     loss_kld = 0.0
-    loss_kld = loss_kld.cast(tl.float32)
+    # loss_kld = loss_kld.cast(tl.float32)
     # tl.device_print("n_cols", n_cols)
     # tl.device_print("BLOCK_SIZE", BLOCK_SIZE)
     test_soft = 0.0
@@ -724,9 +724,9 @@ def liger_cross_entropy_kldiv_kernel(
 
         soft_ref_prob = tl.exp(ref_X1_block - m_ref) / d_ref
 
-        soft_prob = tl.exp(X_block - m) / d
+        # soft_prob = tl.exp(X_block - m) / d
 
-        log_prob_student = tl.log(tl.maximum(soft_prob, 1e-10))
+        log_prob_student = tl.log(tl.maximum(tl.exp(X_block - m) / d, 1e-10))
 
 
         log_prob_teacher = tl.log(tl.maximum(soft_ref_prob, 1e-10))
