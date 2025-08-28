@@ -14,7 +14,8 @@ import copy
 import shutil
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
-from dschat.utils.data.distill_data_utils import create_student_teacher_dataset
+# from dschat.utils.data.distill_data_utils import create_student_teacher_dataset
+from dschat.utils.data.distill_data_utils import create_student_teacher_dataset_220k
 # from torch.utils.data.distributed import DistributedSampler
 from transformers.trainer_utils import seed_worker
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
@@ -65,8 +66,8 @@ def parse_args():
                         nargs='*',
                         # default=['Dahoas/rm-static'],
                         # default = ['lukedai/test'],
-                        default = ["mlabonne/FineTome-100k"],
-                        # default = ['open-r1/OpenR1-Math-220k'],
+                        # default = ["mlabonne/FineTome-100k"],
+                        default = ['open-r1/OpenR1-Math-220k'],
                         help='Path to the training dataset. Accepted format:'
                         '1) a single data path, 2) multiple datasets in the'
                         'form: dataset1-path dataset2-path ...')
@@ -103,18 +104,19 @@ def parse_args():
     parser.add_argument(
         "--student_model_name_or_path",
         type=str,
-        default="Qwen/Qwen2-1.5B",
+        # default="Qwen/Qwen2-1.5B",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
         help=
-        "Path to pretrained model or model identifier from huggingface.co/models.",
+        "Path to student pretrained model or model identifier from huggingface.co/models.",
         required=False,
     )
 
     parser.add_argument(
         "--teacher_model_name_or_path",
         type=str,
-        default="/ssd2/model_arcee-ai_Arcee-Spark",
+        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
         help=
-        "Path to pretrained model or model identifier from huggingface.co/models.",
+        "Path to teacher pretrained model or model identifier from huggingface.co/models.",
         required=False,
     )
 
@@ -122,13 +124,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=40,
+        default=6,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=40,
+        default=6,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -136,7 +138,7 @@ def parse_args():
         type=int,
         # default=512,
         # default=16384,
-        default=1024,
+        default=10000,
         help="The maximum sequence length.",
     )
     parser.add_argument(
@@ -157,7 +159,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=6,
+        default=4,
         help=
         "Number of updates steps to accumulate before performing a backward/update pass.",
     )
@@ -338,6 +340,8 @@ def main():
     #                                       )
     # Load tokenizers
     teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_name_or_path)
+    teacher_tokenizer.padding_side="right" #default is left, for generation purpose
+
     student_tokenizer = AutoTokenizer.from_pretrained(args.student_model_name_or_path)
 
     torch_dtype = (
@@ -375,9 +379,14 @@ def main():
     # teacher_config = AutoConfig.from_pretrained(args.teacher_model_name_or_path)
     # student_config = AutoConfig.from_pretrained(args.student_model_name_or_path)
 
+
+
     #for save usage
     student_config = AutoConfig.from_pretrained(args.student_model_name_or_path)
     teacher_config = AutoConfig.from_pretrained(args.teacher_model_name_or_path)
+
+    student_model.resize_token_embeddings(teacher_model.model.embed_tokens.weight.shape[0])
+
     # if args.compute_fp32_loss:
     #     print_rank_0(
     #         f"Using model {model.__class__.__name__} with loss in fp32",
@@ -400,7 +409,7 @@ def main():
     # student_tokenizer = AutoTokenizer.from_pretrained(args.student_model_name_or_path)
     test = 1
 
-    train_dataset = create_student_teacher_dataset(
+    train_dataset = create_student_teacher_dataset_220k(
         local_rank = args.local_rank,
         data_path=args.data_path,
         data_output_path=args.data_output_path,
@@ -409,17 +418,21 @@ def main():
         student_tokenizer = student_tokenizer,
         max_seq_len = args.max_seq_len
         )
+    train_dataset = train_dataset.select(range(int(train_dataset.shape[0]/10.0)))
+
+
+
     torch.distributed.barrier(device_ids=[args.global_rank])
 
 
     #will determine student and teacher's input_ids alignment issue
     #but since in first version, they are of the same, so just
     #remove teacher_inputs, teacher_attention_mask
-    train_dataset = train_dataset.remove_columns(['teacher_input_ids', 'teacher_attention_mask'])
+    train_dataset = train_dataset.remove_columns(['student_input_ids', 'student_attention_mask'])
 
     #datacollator in dataloader will not recognize student_input_ids and student_attention_mask
     #will change them to input_ids, attention_mask
-    train_dataset = train_dataset.rename_columns({'student_input_ids':'input_ids','student_attention_mask':'attention_mask'})
+    train_dataset = train_dataset.rename_columns({'teacher_input_ids':'input_ids','teacher_attention_mask':'attention_mask'})
 
     #data sampler
     generator = torch.Generator()

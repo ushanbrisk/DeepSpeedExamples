@@ -124,21 +124,43 @@ def create_student_teacher_dataset_220k(local_rank,
         dataset = dataset.shuffle(seed=seed)
 
         def sharegpt_format(example, teacher_tokenizer, student_tokenizer):
-            message = example['messages']
-            # message = []
-            # if isinstance(conversations, list):
-            #     for conversation in conversations:
-            #         if isinstance(conversation, dict):
-            #             if conversation.get('from') == 'human':
-            #                 message.append({"role": "user", "content": conversation.get('value', '')})
-            #             elif conversation.get('from') == 'gpt':
-            #                 message.append({"role": "assistant", "content": conversation.get('value', '')})
-            #             elif conversation.get('from') == 'system':
-            #                 message.insert(0, {"role": "system", "content": conversation.get('value', '')})
+            conversations = example['messages']
+            message = []
+            if isinstance(conversations, list):
+                for conversation in conversations:
+                    if isinstance(conversation, dict):
+                        if conversation.get('role') == 'user':
+                            message.append({"role": "user", "content": conversation.get('content', '')})
+                        # elif conversation.get('from') == 'assistant':
+                        #     message.append({"role": "assistant", "content": conversation.get('content', '')})
+                        # elif conversation.get('from') == 'system':
+                        #     message.insert(0, {"role": "system", "content": conversation.get('content', '')})
             # if not any(msg.get('role') == 'system' for msg in message):
             #     message.insert(0, {"role": "system", "content": "You are a helpful assistant."})
             student_text = student_tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
             teacher_text = teacher_tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+
+            #delete     '<_begin_of_sentence_>'
+            teacher_text = teacher_text[21:]
+
+            answer = []
+            if isinstance(conversations, list):
+                for conversation in conversations:
+                    if isinstance(conversation, dict):
+                        if conversation.get('role') == 'assistant':
+                            answer.append(conversation.get('content', ''))
+                            break
+
+            pure_answer = answer[0]
+            if pure_answer.find("<think>\n")==0:
+                pure_answer = pure_answer[8:]
+
+            student_text = student_text + pure_answer
+            teacher_text = teacher_text + pure_answer
+
+            student_text += student_tokenizer.eos_token
+            teacher_text += teacher_tokenizer.eos_token
+
             return {"student_text": student_text, "teacher_text": teacher_text}
 
 
@@ -167,6 +189,8 @@ def create_student_teacher_dataset_220k(local_rank,
         teacher_tokenized_dataset = teacher_tokenized_dataset.rename_columns(
             {"input_ids": "teacher_input_ids", "attention_mask": "teacher_attention_mask"})
 
+
+        #will not use student tokenizer
         student_tokenized_dataset = teacher_tokenized_dataset.map(tokenize_function, fn_kwargs={"tokenizer": student_tokenizer,
                                                                                                 "column_name": "student_text"},
                                                                   batched=True,
