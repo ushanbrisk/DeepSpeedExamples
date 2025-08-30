@@ -211,3 +211,95 @@ def create_student_teacher_dataset_220k(local_rank,
     torch.distributed.barrier()
     return torch.load(train_fname, weights_only=False)  # modifed 20250402 , weights_only=true
 
+
+
+#only for lukedai/add_test_math dataset
+def create_dataset_lukedai_test_add_math(local_rank,
+                                    data_path,
+                                    data_output_path,
+                                    seed,
+                                    tokenizer,
+                                    max_seq_len,
+                                    ):
+
+    os.makedirs(data_output_path, exist_ok=True)
+    fname = "_".join(data_path)
+    tokenizer_name = tokenizer.init_kwargs["name_or_path"].replace("/", "_")
+
+    #depends on tokenizer, as need tokenzier text
+    fname = f"only_train_full_{fname}_tokenizer{tokenizer_name}_seqlen{max_seq_len}"
+    fname = "_".join(fname.split("/"))
+    fname = hashlib.sha256(fname.encode()).hexdigest(
+    )  # hash the file name to avoid too long file name
+    train_fname = f"{data_output_path}/traindata_{fname}.pt"
+
+    cache_found = os.path.isfile(train_fname)
+    buf_create_cache = torch.ByteTensor([not cache_found]).to(
+        get_accelerator().current_device_name())
+    torch.distributed.all_reduce(buf_create_cache)
+
+    if local_rank == 0 and (buf_create_cache.item() != 0):
+        # copied from Distill proejct
+        # dataset = load_from_disk("/ssd2/mlabonne_FineTome-100k")
+        dataset = load_dataset(data_path[0], split="test") #here default to only 1 dataset
+
+
+
+
+        # dataset = dataset.shuffle(seed=seed)
+
+        def sharegpt_format(example, tokenizer):
+            prompt = example['prompt']
+            message = []
+            message.append({"role": "user", "content": prompt})
+            text = tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+
+            answer = []
+            pure_answer = example['completion']
+
+            if pure_answer.find("<think>")==0:
+                pure_answer = pure_answer[7:]
+
+            text = text + pure_answer
+
+            text += tokenizer.eos_token
+
+
+            return {"text": text}
+
+
+        # Preprocess and tokenize the dataset
+
+        map_kwargs = {}
+        map_kwargs["num_proc"] = 52  # here is the parallel process number
+        map_kwargs["desc"] = f"Applying chat template to {data_path[0]} dataset"
+
+        print("Preprocessing and tokenizing dataset...")
+        original_columns = dataset.column_names
+        dataset = dataset.map(sharegpt_format,
+                              fn_kwargs={"tokenizer": tokenizer},
+                              remove_columns=original_columns, **map_kwargs)
+
+
+        def tokenize_function(examples, tokenizer, column_name):
+            result = tokenizer(examples[column_name], truncation=True, max_length=max_seq_len,
+                             padding="max_length")
+
+            #for bug of non-stopping, we need to manully add eos in the case of truncation
+            data_num = len(result.attention_mask)
+            for i in range(data_num):
+                if result.attention_mask[i][-1] == 1: #mostly be truncated
+                    result.input_ids[i][-1] = tokenizer.eos_token_id
+            return result
+
+        tokenized_dataset = dataset.map(tokenize_function,
+                                                fn_kwargs={"tokenizer": tokenizer, "column_name": "text"},
+                                                batched=True,
+                                                num_proc=14, remove_columns=["text"])
+
+
+        print(f'finish read dataset')
+        torch.save(tokenized_dataset, train_fname)
+    torch.distributed.barrier()
+    return torch.load(train_fname, weights_only=False)  # modifed 20250402 , weights_only=true
+
