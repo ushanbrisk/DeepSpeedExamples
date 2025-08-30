@@ -105,7 +105,8 @@ def parse_args():
         "--student_model_name_or_path",
         type=str,
         # default="Qwen/Qwen2-1.5B",
-        default="Qwen/Qwen2.5-0.5B-Instruct",
+        # default="Qwen/Qwen2.5-0.5B-Instruct",
+        default="lukedai/model_deepseek_1.5b",
         help=
         "Path to student pretrained model or model identifier from huggingface.co/models.",
         required=False,
@@ -124,13 +125,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=6,
+        default=3,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=6,
+        default=3,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -138,7 +139,7 @@ def parse_args():
         type=int,
         # default=512,
         # default=16384,
-        default=10000,
+        default=9000,
         help="The maximum sequence length.",
     )
     parser.add_argument(
@@ -342,7 +343,9 @@ def main():
     teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_name_or_path)
     teacher_tokenizer.padding_side="right" #default is left, for generation purpose
 
-    student_tokenizer = AutoTokenizer.from_pretrained(args.student_model_name_or_path)
+    # student_tokenizer = AutoTokenizer.from_pretrained(args.student_model_name_or_path)
+    student_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_name_or_path)
+    student_tokenizer.padding_side = "right"  # default is left, for generation purpose
 
     torch_dtype = (
         args.torch_dtype if args.torch_dtype in ["auto", None] else getattr(torch, args.torch_dtype)
@@ -385,7 +388,9 @@ def main():
     student_config = AutoConfig.from_pretrained(args.student_model_name_or_path)
     teacher_config = AutoConfig.from_pretrained(args.teacher_model_name_or_path)
 
-    student_model.resize_token_embeddings(teacher_model.model.embed_tokens.weight.shape[0])
+
+    if student_model.model.embed_tokens.weight.shape[0] != teacher_model.model.embed_tokens.weight.shape[0]:
+        student_model.resize_token_embeddings(teacher_model.model.embed_tokens.weight.shape[0])
 
     # if args.compute_fp32_loss:
     #     print_rank_0(
@@ -418,7 +423,10 @@ def main():
         student_tokenizer = student_tokenizer,
         max_seq_len = args.max_seq_len
         )
-    train_dataset = train_dataset.select(range(int(train_dataset.shape[0]/10.0)))
+    if train_dataset.num_rows > 10000:
+        train_dataset = train_dataset.select(range(int(train_dataset.shape[0]/20.0)))
+
+
 
 
 
@@ -511,6 +519,9 @@ def main():
     #so we need to move it to gpu, only for last stage. to reduce GPU memory occupy
     if args.global_rank == args.num_stages-1:
         teacher_model.lm_head.to(device)
+
+    if args.global_rank == args.num_stages -1 and student_config.tie_word_embeddings==False:
+        student_model.lm_head.to(device).half()
 
     #end of teacher lm head moving to device, maybe has no effect
 

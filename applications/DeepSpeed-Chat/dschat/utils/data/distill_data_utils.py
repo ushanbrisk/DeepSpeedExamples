@@ -99,14 +99,15 @@ def create_student_teacher_dataset_220k(local_rank,
                                     seed,
                                     teacher_tokenizer,
                                     student_tokenizer,
-                                    max_seq_len):
+                                    max_seq_len,
+                                    filter_answer_len = 5000):
 
     os.makedirs(data_output_path, exist_ok=True)
     fname = "_".join(data_path)
     teacher_tokenizer_name = teacher_tokenizer.init_kwargs["name_or_path"].replace("/", "_")
     student_tokenizer_name = student_tokenizer.init_kwargs["name_or_path"].replace("/", "_")
     #depends on tokenizer, as need tokenzier text
-    fname = f"only_train_full_{fname}_tokenizer{teacher_tokenizer_name}_{student_tokenizer_name}_seqlen{max_seq_len}"
+    fname = f"only_train_full_{fname}_tokenizer{teacher_tokenizer_name}_{student_tokenizer_name}_seqlen{max_seq_len}_filterlen{filter_answer_len}"
     fname = "_".join(fname.split("/"))
     fname = hashlib.sha256(fname.encode()).hexdigest(
     )  # hash the file name to avoid too long file name
@@ -121,7 +122,8 @@ def create_student_teacher_dataset_220k(local_rank,
         # copied from Distill proejct
         # dataset = load_from_disk("/ssd2/mlabonne_FineTome-100k")
         dataset = load_dataset(data_path[0], split="train") #here default to only 1 dataset
-        dataset = dataset.shuffle(seed=seed)
+        dataset = dataset.filter(lambda x: len(x['messages'][1]['content']) < filter_answer_len)
+        # dataset = dataset.shuffle(seed=seed)
 
         def sharegpt_format(example, teacher_tokenizer, student_tokenizer):
             conversations = example['messages']
@@ -131,7 +133,7 @@ def create_student_teacher_dataset_220k(local_rank,
                     if isinstance(conversation, dict):
                         if conversation.get('role') == 'user':
                             message.append({"role": "user", "content": conversation.get('content', '')})
-                        # elif conversation.get('from') == 'assistant':
+                        # elif conversation.get('role') == 'assistant':
                         #     message.append({"role": "assistant", "content": conversation.get('content', '')})
                         # elif conversation.get('from') == 'system':
                         #     message.insert(0, {"role": "system", "content": conversation.get('content', '')})
@@ -178,14 +180,20 @@ def create_student_teacher_dataset_220k(local_rank,
 
 
         def tokenize_function(examples, tokenizer, column_name):
-            return tokenizer(examples[column_name], truncation=True, max_length=max_seq_len,
+            result = tokenizer(examples[column_name], truncation=True, max_length=max_seq_len,
                              padding="max_length")
 
+            #for bug of non-stopping, we need to manully add eos in the case of truncation
+            data_num = len(result.attention_mask)
+            for i in range(data_num):
+                if result.attention_mask[i][-1] == 1: #mostly be truncated
+                    result.input_ids[i][-1] = tokenizer.eos_token_id
+            return result
 
         teacher_tokenized_dataset = dataset.map(tokenize_function,
                                                 fn_kwargs={"tokenizer": teacher_tokenizer, "column_name": "teacher_text"},
                                                 batched=True,
-                                                num_proc=8, remove_columns=["teacher_text"])
+                                                num_proc=14, remove_columns=["teacher_text"])
         teacher_tokenized_dataset = teacher_tokenized_dataset.rename_columns(
             {"input_ids": "teacher_input_ids", "attention_mask": "teacher_attention_mask"})
 
@@ -194,7 +202,7 @@ def create_student_teacher_dataset_220k(local_rank,
         student_tokenized_dataset = teacher_tokenized_dataset.map(tokenize_function, fn_kwargs={"tokenizer": student_tokenizer,
                                                                                                 "column_name": "student_text"},
                                                                   batched=True,
-                                                                  num_proc=8, remove_columns=["student_text"])
+                                                                  num_proc=14, remove_columns=["student_text"])
         student_tokenized_dataset = student_tokenized_dataset.rename_columns(
             {"input_ids": "student_input_ids", "attention_mask": "student_attention_mask"})
 
